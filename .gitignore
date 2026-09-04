@@ -1,10 +1,55 @@
+# Python
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
+*.py[cod]
+*$py.class
+*.so
 .Python
+build/
+dist/
+*.egg-info/
+*.egg
+
+# Virtualenvs
 venv/
 .venv/
+env/
+
+# Test / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.cache/
+
+# Logs / runtime artefacts
 *.log
+*.log.*
+*.pid
+*.sock
+.tmp/
+.mappings.db
+*.db
+*.db-wal
+*.db-shm
+
+# Local env / secrets
 .env
-.venv.bak
+.env.*
+*.env
+.envrc
+
+# OS junk
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editors / IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Project runtime files
+.ssh/
+.cookies/
