@@ -1,0 +1,197 @@
+"""HLS/M3U streaming helpers.
+
+Pure (no I/O) so they are easy to unit test.
+"""
+
+from __future__ import annotations
+
+import re
+from typing import Optional
+from urllib.parse import urljoin, urlparse, urlencode, quote
+
+
+EXTINF_RE = re.compile(r"#EXTINF:([0-9.\-]+),")
+
+
+def parse_m3u_attributes(line: str) -> dict[str, str]:
+    """Parse an #EXT-X line's KEY=VALUE,VALUE2 list into a dict.
+
+    Quoted values are unquoted. Unquoted values are taken verbatim
+    until the next comma.
+    """
+    if not line.startswith("#EXT"):
+        return {}
+    body = line.split(":", 1)[1] if ":" in line else ""
+    attrs: dict[str, str] = {}
+    i = 0
+    n = len(body)
+    while i < n:
+        # find KEY=
+        eq = body.find("=", i)
+        if eq < 0:
+            break
+        key = body[i:eq].strip()
+        i = eq + 1
+        if i >= n:
+            attrs[key] = ""
+            break
+        if body[i] == '"':
+            # quoted value
+            j = body.find('"', i + 1)
+            if j < 0:
+                attrs[key] = body[i + 1:]
+                break
+            attrs[key] = body[i + 1:j]
+            i = j + 1
+            # skip comma separator
+            if i < n and body[i] == ",":
+                i += 1
+        else:
+            # unquoted value: up to next comma
+            j = body.find(",", i)
+            if j < 0:
+                attrs[key] = body[i:].strip()
+                break
+            attrs[key] = body[i:j].strip()
+            i = j + 1
+    return attrs
+
+
+def classify_hls(body: str) -> dict:
+    """Inspect an HLS playlist and return simple statistics.
+
+    Returns dict with keys: kind ('master' | 'media' | 'unknown'),
+    variants (int), extinf_count (int), is_vod (bool).
+    """
+    out: dict = {
+        "kind": "unknown",
+        "variants": 0,
+        "extinf_count": 0,
+        "is_vod": False,
+    }
+    if not body:
+        return out
+    lines = body.splitlines()
+    is_master = False
+    is_media = False
+    extinf = 0
+    for raw in lines:
+        line = raw.strip()
+        if line.startswith("#EXT-X-STREAM-INF"):
+            is_master = True
+            out["variants"] += 1
+        elif line.startswith("#EXTINF"):
+            is_media = True
+            extinf += 1
+        elif line.startswith("#EXT-X-ENDLIST"):
+            out["is_vod"] = True
+    if is_master and not is_media:
+        out["kind"] = "master"
+    elif is_media and not is_master:
+        out["kind"] = "media"
+    elif is_master and is_media:
+        out["kind"] = "master"
+    else:
+        out["kind"] = "media" if extinf > 0 else "unknown"
+    out["extinf_count"] = extinf
+    return out
+
+
+def rewrite_playlist(
+    body: str,
+    base_url: str,
+    proxy_base_url: str,
+    token: Optional[str],
+) -> str:
+    """Rewrite an HLS playlist so every URI passes through the proxy.
+
+    Handles:
+      - relative segment URLs
+      - absolute segment URLs
+      - child/variant playlists (.m3u8)
+      - .ts / .m4s segments
+      - EXT-X-KEY URI="..."  (and other URI= attributes)
+      - EXT-X-MAP URI="..."
+    """
+    out_lines: list[str] = []
+    for raw_line in body.splitlines():
+        line = raw_line.rstrip("\r")
+        stripped = line.strip()
+        if not stripped:
+            out_lines.append(line)
+            continue
+        if stripped.startswith("#EXT"):
+            out_lines.append(
+                _rewrite_attribute_line(stripped, base_url, proxy_base_url, token)
+            )
+            continue
+        out_lines.append(_rewrite_uri_line(stripped, base_url, proxy_base_url, token))
+    return "\n".join(out_lines) + ("\n" if body.endswith("\n") else "")
+
+
+def _rewrite_uri_line(
+    uri: str, base_url: str, proxy_base_url: str, token: Optional[str]
+) -> str:
+    absolute = urljoin(base_url, uri)
+    proxy_qs = urlencode({"upstream": absolute, "token": token or ""})
+    return f"{proxy_base_url}?{proxy_qs}"
+
+
+def _rewrite_attribute_line(
+    line: str, base_url: str, proxy_base_url: str, token: Optional[str]
+) -> str:
+    if "URI=\"" not in line:
+        return line
+    prefix, rest = line.split("URI=\"", 1)
+    uri, after = rest.split("\"", 1)
+    absolute = urljoin(base_url, uri)
+    proxy_qs = urlencode({"upstream": absolute, "token": token or ""})
+    new_uri = f"{proxy_base_url}?{proxy_qs}"
+    return f"{prefix}URI=\"{new_uri}\"{after}"
+
+
+def looks_like_playlist(url: str, content_type: str) -> bool:
+    if url.lower().endswith(".m3u8"):
+        return True
+    if "mpegurl" in content_type.lower():
+        return True
+    return False
+
+
+def safe_host(url: str) -> str:
+    try:
+        return urlparse(url).hostname or "?"
+    except Exception:
+        return "?"
+
+
+def generate_user_m3u(
+    public_url: str,
+    channels: list[dict],
+    token: str,
+) -> str:
+    """Render a per-viewer M3U pointing at the proxy's /playlist URLs.
+
+    Each entry is an #EXTINF followed by a URL of the form:
+      <public_url>/live/<slug>.m3u8?token=<token>
+    """
+    out = ["#EXTM3U"]
+    for ch in channels:
+        if not ch.get("enabled", True):
+            continue
+        attrs = []
+        if ch.get("logo_url"):
+            attrs.append(f'tvg-logo="{_escape_attr(ch["logo_url"])}"')
+        attrs.append(f'tvg-id="{_escape_attr(ch.get("slug", ""))}"')
+        attrs.append(f'group-title="{_escape_attr(ch.get("group", "TVProxy"))}"')
+        attr_str = " ".join(attrs)
+        name = ch.get("display_name") or ch.get("slug") or "Channel"
+        slug = ch.get("slug") or ""
+        url = f"{public_url.rstrip('/')}/live/{quote(slug, safe='')}.m3u8?token={quote(token, safe='')}"
+        out.append(f"#EXTINF:-1 {attr_str},{name}")
+        out.append(url)
+    return "\n".join(out) + "\n"
+
+
+def _escape_attr(value: str) -> str:
+    return value.replace('"', '\\"')
