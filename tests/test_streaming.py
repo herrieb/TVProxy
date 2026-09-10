@@ -5,12 +5,21 @@ from app.streaming import (
     generate_user_m3u,
     looks_like_playlist,
     parse_m3u_attributes,
+    parse_m3u_entries,
     rewrite_playlist,
     safe_host,
 )
 
 
 class TestParseM3UAttributes:
+    def test_parse_provider_entries(self):
+        entries = parse_m3u_entries(
+            '#EXTM3U\n#EXTINF:-1 tvg-logo="[" group-title="NL",NPO 1\n/live/npo.m3u8\n',
+            "https://provider.example/list.m3u",
+        )
+        assert entries[0]["group"] == "NL"
+        assert entries[0]["url"] == "https://provider.example/live/npo.m3u8"
+
     def test_ext_x_key(self):
         attrs = parse_m3u_attributes(
             '#EXT-X-KEY:METHOD=AES-128,URI="https://x/key.bin",IV=0x9c7db8778570d05c3177c349fd9236aa'
@@ -164,6 +173,15 @@ class TestSafeHost:
 
 
 class TestGenerateUserM3u:
+    def test_imported_metadata_and_bad_logo(self):
+        m3u = generate_user_m3u(
+            "https://tv.berrie.uk",
+            [{"slug": "c", "display_name": "C", "description": "News", "logo_url": "[", "enabled": True}],
+            "tok",
+        )
+        assert 'group-title="News"' in m3u
+        assert 'tvg-logo=' not in m3u
+
     def test_basic(self):
         m3u = generate_user_m3u(
             "https://tv.berrie.uk",

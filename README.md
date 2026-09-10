@@ -121,6 +121,37 @@ Use the admin UI to map a slug like `kempen-tv` to your upstream
 HLS URL.  The form requires the upstream's hostname for SSRF
 allowlisting — it must match `urlparse(UPSTREAM_URL).hostname`.
 
+## Management API
+
+The versioned JSON management API is available at
+`https://tv.berrie.uk/api/v1/`. Interactive documentation is at `/api/docs`,
+and the OpenAPI document is at `/api/openapi.json`. See `API.md` for the
+complete endpoint inventory.
+
+Create a separate management token on the Pi; it is shown only once:
+
+```
+sudo -u tvproxy /opt/tv-proxy/venv/bin/python -m app.cli \
+  create-api-token "Main website" --description "Website integration"
+```
+
+Use it as `Authorization: Bearer YOUR_API_TOKEN`. This token is unrelated to
+viewer IPTV tokens. Revoke a token with `DELETE /api/v1/api-tokens/{id}`.
+Browser clients require their exact origin in `API_ALLOWED_ORIGINS`; wildcard
+CORS is not enabled.
+
+Recordings are handled by the separate `tv-proxy-recorder.service`. Configure
+personal OneDrive with rclone, set `TVPROXY_ONEDRIVE_REMOTE` in
+`/etc/tv-proxy.env`, then enable the worker:
+
+```
+sudo systemctl enable --now tv-proxy-recorder
+```
+
+The worker reserves 10 GB on the Pi, records with FFmpeg stream copy, verifies
+the OneDrive upload, and deletes the local file only after successful upload.
+Storage is available through `GET /api/v1/storage`.
+
 ## Common operations
 
 ### Restart the application

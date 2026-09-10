@@ -8,6 +8,7 @@ running aiohttp.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import secrets
@@ -63,7 +64,10 @@ CREATE TABLE IF NOT EXISTS viewers (
     description     TEXT NOT NULL DEFAULT '',
     token           TEXT NOT NULL UNIQUE,
     token_prefix    TEXT NOT NULL DEFAULT '',
+    short_code      TEXT UNIQUE,
+    short_enabled   INTEGER NOT NULL DEFAULT 1,
     allowed_channels TEXT NOT NULL DEFAULT '',
+    favorite_channels TEXT NOT NULL DEFAULT '',
     max_connections INTEGER NOT NULL DEFAULT 1,
     expires_at      REAL,
     disabled        INTEGER NOT NULL DEFAULT 0,
@@ -107,6 +111,36 @@ CREATE TABLE IF NOT EXISTS settings (
     value           TEXT NOT NULL,
     updated_at      REAL NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS api_tokens (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    name        TEXT NOT NULL UNIQUE,
+    description TEXT NOT NULL DEFAULT '',
+    token_hash  TEXT NOT NULL UNIQUE,
+    token_prefix TEXT NOT NULL DEFAULT '',
+    enabled     INTEGER NOT NULL DEFAULT 1,
+    expires_at  REAL,
+    created_at  REAL NOT NULL,
+    last_used_at REAL
+);
+
+CREATE TABLE IF NOT EXISTS recordings (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    viewer_id   INTEGER NOT NULL REFERENCES viewers(id) ON DELETE CASCADE,
+    channel_id  INTEGER NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
+    title       TEXT NOT NULL DEFAULT '',
+    start_at    REAL NOT NULL,
+    end_at      REAL NOT NULL,
+    timezone    TEXT NOT NULL DEFAULT 'UTC',
+    status      TEXT NOT NULL DEFAULT 'scheduled',
+    local_path  TEXT NOT NULL DEFAULT '',
+    remote_path TEXT NOT NULL DEFAULT '',
+    error       TEXT NOT NULL DEFAULT '',
+    created_at  REAL NOT NULL,
+    updated_at  REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS recordings_schedule_idx ON recordings(status, start_at);
+CREATE INDEX IF NOT EXISTS recordings_viewer_idx ON recordings(viewer_id, start_at DESC);
 """
 
 
@@ -137,6 +171,15 @@ class _BaseStore:
             conn = _connect(self.path)
             try:
                 conn.executescript(SCHEMA)
+                columns = {r[1] for r in conn.execute("PRAGMA table_info(viewers)")}
+                if "short_code" not in columns:
+                    conn.execute("ALTER TABLE viewers ADD COLUMN short_code TEXT")
+                if "short_enabled" not in columns:
+                    conn.execute("ALTER TABLE viewers ADD COLUMN short_enabled INTEGER NOT NULL DEFAULT 1")
+                if "favorite_channels" not in columns:
+                    conn.execute("ALTER TABLE viewers ADD COLUMN favorite_channels TEXT NOT NULL DEFAULT ''")
+                conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS viewers_short_code_idx ON viewers(short_code)")
+                conn.execute("UPDATE viewers SET short_code=lower(substr(hex(randomblob(3)),1,4)) WHERE short_code IS NULL")
                 self._initialized = True
             finally:
                 conn.close()
@@ -403,6 +446,10 @@ def generate_viewer_token() -> str:
     return secrets.token_urlsafe(32)
 
 
+def generate_viewer_short_code() -> str:
+    return secrets.token_urlsafe(3).replace("_", "A").replace("-", "B")[:4]
+
+
 def hash_password(password: str, salt_hex: str) -> str:
     salted = (salt_hex + ":" + password).encode("utf-8")
     return bcrypt.hashpw(salted, bcrypt.gensalt(rounds=10)).decode("utf-8")
@@ -446,6 +493,7 @@ class ViewerStore(_BaseStore):
                     r["allowed_channel_ids"] = _parse_allowed_channels(
                         r.get("allowed_channels", "")
                     )
+                    r["favorite_channel_ids"] = _parse_allowed_channels(r.get("favorite_channels", ""))
                 return rows
             finally:
                 conn.close()
@@ -462,6 +510,7 @@ class ViewerStore(_BaseStore):
                 d["allowed_channel_ids"] = _parse_allowed_channels(
                     d.get("allowed_channels", "")
                 )
+                d["favorite_channel_ids"] = _parse_allowed_channels(d.get("favorite_channels", ""))
                 return d
             finally:
                 conn.close()
@@ -480,6 +529,24 @@ class ViewerStore(_BaseStore):
                 d["allowed_channel_ids"] = _parse_allowed_channels(
                     d.get("allowed_channels", "")
                 )
+                d["favorite_channel_ids"] = _parse_allowed_channels(d.get("favorite_channels", ""))
+                return d
+            finally:
+                conn.close()
+        return await asyncio.to_thread(_do)
+
+    async def get_by_short_code(self, code: str) -> Optional[dict]:
+        def _do():
+            conn = self._conn()
+            try:
+                row = conn.execute(
+                    "SELECT * FROM viewers WHERE short_code = ? AND short_enabled = 1", (code,)
+                ).fetchone()
+                if not row:
+                    return None
+                d = dict(row)
+                d["allowed_channel_ids"] = _parse_allowed_channels(d.get("allowed_channels", ""))
+                d["favorite_channel_ids"] = _parse_allowed_channels(d.get("favorite_channels", ""))
                 return d
             finally:
                 conn.close()
@@ -495,6 +562,7 @@ class ViewerStore(_BaseStore):
     ) -> Tuple[bool, str, Optional[dict]]:
         token = generate_viewer_token()
         token_prefix = token[:4]
+        short_code = generate_viewer_short_code()
         now = time.time()
         allowed_json = _dump_allowed_channels(allowed_channel_ids)
 
@@ -503,11 +571,11 @@ class ViewerStore(_BaseStore):
             try:
                 cur = conn.execute(
                     """INSERT INTO viewers
-                       (name, description, token, token_prefix,
+                       (name, description, token, token_prefix, short_code,
                         allowed_channels, max_connections, expires_at,
                         disabled, created_at, updated_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?)""",
-                    (name, description, token, token_prefix,
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)""",
+                    (name, description, token, token_prefix, short_code,
                      allowed_json, max_connections, expires_at,
                      now, now),
                 )
@@ -551,6 +619,18 @@ class ViewerStore(_BaseStore):
                 conn.close()
         return await asyncio.to_thread(_do)
 
+    async def set_favorites(self, vid: int, channel_ids: Iterable[int]) -> bool:
+        now = time.time()
+        favorite_json = _dump_allowed_channels(channel_ids)
+        def _do():
+            conn = self._conn()
+            try:
+                cur = conn.execute("UPDATE viewers SET favorite_channels=?, updated_at=? WHERE id=?", (favorite_json, now, vid))
+                return cur.rowcount > 0
+            finally:
+                conn.close()
+        return await asyncio.to_thread(_do)
+
     async def regenerate_token(self, vid: int) -> Optional[str]:
         token = generate_viewer_token()
         token_prefix = token[:4]
@@ -568,6 +648,32 @@ class ViewerStore(_BaseStore):
                 conn.close()
         ok = await asyncio.to_thread(_do)
         return token if ok else None
+
+    async def set_short_access(self, vid: int, enabled: bool) -> bool:
+        def _do():
+            conn = self._conn()
+            try:
+                cur = conn.execute("UPDATE viewers SET short_enabled=?, updated_at=? WHERE id=?", (1 if enabled else 0, time.time(), vid))
+                return cur.rowcount > 0
+            finally:
+                conn.close()
+        return await asyncio.to_thread(_do)
+
+    async def regenerate_short_code(self, vid: int) -> Optional[str]:
+        for _ in range(10):
+            code = generate_viewer_short_code()
+            def _do():
+                conn = self._conn()
+                try:
+                    cur = conn.execute("UPDATE viewers SET short_code=?, short_enabled=1, updated_at=? WHERE id=?", (code, time.time(), vid))
+                    return cur.rowcount > 0
+                except sqlite3.IntegrityError:
+                    return False
+                finally:
+                    conn.close()
+            if await asyncio.to_thread(_do):
+                return code
+        return None
 
     async def delete(self, vid: int) -> bool:
         def _do():
@@ -785,6 +891,189 @@ class AdminUserStore(_BaseStore):
             finally:
                 conn.close()
         await asyncio.to_thread(_do)
+
+
+# ---- Management API tokens ----
+
+
+class ApiTokenStore(_BaseStore):
+    @staticmethod
+    def _hash(token: str) -> str:
+        return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+    async def create(self, name: str, description: str = "", expires_at=None):
+        token = secrets.token_urlsafe(32)
+        now = time.time()
+
+        def _do():
+            conn = self._conn()
+            try:
+                cur = conn.execute(
+                    """INSERT INTO api_tokens
+                       (name, description, token_hash, token_prefix, enabled,
+                        expires_at, created_at)
+                       VALUES (?, ?, ?, ?, 1, ?, ?)""",
+                    (name.strip(), description.strip(), self._hash(token),
+                     token[:8], expires_at, now),
+                )
+                return cur.lastrowid
+            finally:
+                conn.close()
+
+        row_id = await asyncio.to_thread(_do)
+        return token, await self.get(row_id)
+
+    async def get(self, token_id: int):
+        def _do():
+            conn = self._conn()
+            try:
+                row = conn.execute(
+                    """SELECT id, name, description, token_prefix, enabled,
+                              expires_at, created_at, last_used_at
+                       FROM api_tokens WHERE id=?""", (token_id,)
+                ).fetchone()
+                return dict(row) if row else None
+            finally:
+                conn.close()
+        return await asyncio.to_thread(_do)
+
+    async def list_all(self):
+        def _do():
+            conn = self._conn()
+            try:
+                return [dict(row) for row in conn.execute(
+                    """SELECT id, name, description, token_prefix, enabled,
+                              expires_at, created_at, last_used_at
+                       FROM api_tokens ORDER BY id"""
+                ).fetchall()]
+            finally:
+                conn.close()
+        return await asyncio.to_thread(_do)
+
+    async def authenticate(self, token: str):
+        token_hash = self._hash(token)
+        now = time.time()
+
+        def _do():
+            conn = self._conn()
+            try:
+                row = conn.execute(
+                    """SELECT id, name, description, enabled, expires_at
+                       FROM api_tokens WHERE token_hash=?""", (token_hash,)
+                ).fetchone()
+                if not row or not row["enabled"] or (row["expires_at"] and row["expires_at"] < now):
+                    return None
+                conn.execute("UPDATE api_tokens SET last_used_at=? WHERE id=?", (now, row["id"]))
+                return dict(row)
+            finally:
+                conn.close()
+        return await asyncio.to_thread(_do)
+
+    async def set_enabled(self, token_id: int, enabled: bool) -> bool:
+        def _do():
+            conn = self._conn()
+            try:
+                cur = conn.execute("UPDATE api_tokens SET enabled=? WHERE id=?", (1 if enabled else 0, token_id))
+                return cur.rowcount > 0
+            finally:
+                conn.close()
+        return await asyncio.to_thread(_do)
+
+    async def delete(self, token_id: int) -> bool:
+        def _do():
+            conn = self._conn()
+            try:
+                cur = conn.execute("DELETE FROM api_tokens WHERE id=?", (token_id,))
+                return cur.rowcount > 0
+            finally:
+                conn.close()
+        return await asyncio.to_thread(_do)
+
+
+# ---- Recordings ----
+
+
+class RecordingStore(_BaseStore):
+    async def create(self, viewer_id: int, channel_id: int, title: str,
+                     start_at: float, end_at: float, timezone: str):
+        now = time.time()
+        def _do():
+            conn = self._conn()
+            try:
+                cur = conn.execute(
+                    """INSERT INTO recordings
+                       (viewer_id, channel_id, title, start_at, end_at,
+                        timezone, status, created_at, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?, 'scheduled', ?, ?)""",
+                    (viewer_id, channel_id, title[:200], start_at, end_at,
+                     timezone[:64], now, now),
+                )
+                return cur.lastrowid
+            finally:
+                conn.close()
+        return await self.get(await asyncio.to_thread(_do))
+
+    async def get(self, recording_id: int):
+        def _do():
+            conn = self._conn()
+            try:
+                row = conn.execute("SELECT * FROM recordings WHERE id=?", (recording_id,)).fetchone()
+                return dict(row) if row else None
+            finally:
+                conn.close()
+        return await asyncio.to_thread(_do)
+
+    async def list_all(self, viewer_id: Optional[int] = None):
+        def _do():
+            conn = self._conn()
+            try:
+                if viewer_id is None:
+                    rows = conn.execute("SELECT * FROM recordings ORDER BY start_at DESC").fetchall()
+                else:
+                    rows = conn.execute("SELECT * FROM recordings WHERE viewer_id=? ORDER BY start_at DESC", (viewer_id,)).fetchall()
+                return [dict(row) for row in rows]
+            finally:
+                conn.close()
+        return await asyncio.to_thread(_do)
+
+    async def due(self, now: float):
+        def _do():
+            conn = self._conn()
+            try:
+                rows = conn.execute(
+                    "SELECT * FROM recordings WHERE status='scheduled' AND start_at<=? ORDER BY start_at",
+                    (now,),
+                ).fetchall()
+                return [dict(row) for row in rows]
+            finally:
+                conn.close()
+        return await asyncio.to_thread(_do)
+
+    async def update(self, recording_id: int, **fields) -> bool:
+        allowed = {"status", "local_path", "remote_path", "error", "title", "start_at", "end_at", "timezone", "actual_duration"}
+        fields = {k: v for k, v in fields.items() if k in allowed}
+        if not fields:
+            return False
+        fields["updated_at"] = time.time()
+        def _do():
+            conn = self._conn()
+            try:
+                sql = ", ".join(f"{key}=?" for key in fields)
+                cur = conn.execute(f"UPDATE recordings SET {sql} WHERE id=?", (*fields.values(), recording_id))
+                return cur.rowcount > 0
+            finally:
+                conn.close()
+        return await asyncio.to_thread(_do)
+
+    async def delete(self, recording_id: int) -> bool:
+        def _do():
+            conn = self._conn()
+            try:
+                cur = conn.execute("DELETE FROM recordings WHERE id=?", (recording_id,))
+                return cur.rowcount > 0
+            finally:
+                conn.close()
+        return await asyncio.to_thread(_do)
 
 
 # ---- Audit log ----

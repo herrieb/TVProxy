@@ -13,6 +13,27 @@ from urllib.parse import urljoin, urlparse, urlencode, quote
 EXTINF_RE = re.compile(r"#EXTINF:([0-9.\-]+),")
 
 
+def parse_m3u_entries(body: str, base_url: str = "") -> list[dict[str, str]]:
+    """Parse a provider M3U into display metadata and absolute stream URLs."""
+    entries = []
+    pending = None
+    for raw in body.splitlines():
+        line = raw.strip()
+        if line.upper().startswith("#EXTINF"):
+            name = line.rsplit(",", 1)[-1].strip() or "Channel"
+            attrs = dict(re.findall(r'(?:^|\s)([\w-]+)="([^"]*)"', line))
+            pending = {
+                "display_name": name,
+                "group": attrs.get("group-title", "TVProxy"),
+                "logo_url": attrs.get("tvg-logo", ""),
+            }
+        elif line and not line.startswith("#") and pending is not None:
+            pending["url"] = urljoin(base_url, line)
+            entries.append(pending)
+            pending = None
+    return entries
+
+
 def parse_m3u_attributes(line: str) -> dict[str, str]:
     """Parse an #EXT-X line's KEY=VALUE,VALUE2 list into a dict.
 
@@ -169,6 +190,11 @@ def generate_user_m3u(
     public_url: str,
     channels: list[dict],
     token: str,
+    short_code: Optional[str] = None,
+    recordings: Optional[list[dict]] = None,
+    local_recording_url: str = "",
+    external_recording_url: str = "",
+    external_recording_token: str = "",
 ) -> str:
     """Render a per-viewer M3U pointing at the proxy's /playlist URLs.
 
@@ -180,16 +206,34 @@ def generate_user_m3u(
         if not ch.get("enabled", True):
             continue
         attrs = []
-        if ch.get("logo_url"):
-            attrs.append(f'tvg-logo="{_escape_attr(ch["logo_url"])}"')
+        logo = ch.get("logo_url", "")
+        if logo and urlparse(logo).scheme in ("http", "https") and urlparse(logo).netloc:
+            attrs.append(f'tvg-logo="{_escape_attr(logo)}"')
         attrs.append(f'tvg-id="{_escape_attr(ch.get("slug", ""))}"')
-        attrs.append(f'group-title="{_escape_attr(ch.get("group", "TVProxy"))}"')
+        group = ch.get("group") or ch.get("description") or "TVProxy"
+        attrs.append(f'group-title="{_escape_attr(group)}"')
         attr_str = " ".join(attrs)
-        name = ch.get("display_name") or ch.get("slug") or "Channel"
+        name = (ch.get("display_name") or ch.get("slug") or "Channel").replace("\r", " ").replace("\n", " ")
         slug = ch.get("slug") or ""
-        url = f"{public_url.rstrip('/')}/live/{quote(slug, safe='')}.m3u8?token={quote(token, safe='')}"
+        if short_code:
+            url = f"{public_url.rstrip('/')}/tv/{quote(short_code, safe='')}/{quote(slug, safe='')}.m3u8"
+        else:
+            url = f"{public_url.rstrip('/')}/live/{quote(slug, safe='')}.m3u8?token={quote(token, safe='')}"
         out.append(f"#EXTINF:-1 {attr_str},{name}")
         out.append(url)
+    for recording in recordings or []:
+        name = (recording.get("title") or f"Recording {recording.get('id', '')}").replace("\r", " ").replace("\n", " ")
+        filename = recording.get("external_filename") or ""
+        local_base = local_recording_url.rstrip('/')
+        if local_base.endswith('/iptv') and filename:
+            local_url = f"{local_base}/{quote(filename, safe='')}?token={quote(external_recording_token, safe='')}"
+        else:
+            local_url = f"{local_base}/recording/{recording['id']}.ts?token={quote(token, safe='')}"
+        out.append(f'#EXTINF:-1 group-title="Local",{_escape_attr(name)}')
+        out.append(local_url)
+        if external_recording_url and external_recording_token and filename:
+            out.append(f'#EXTINF:-1 group-title="External hosted",{_escape_attr(name)}')
+            out.append(f"{external_recording_url.rstrip('/')}/{quote(filename, safe='')}?token={quote(external_recording_token, safe='')}")
     return "\n".join(out) + "\n"
 
 
