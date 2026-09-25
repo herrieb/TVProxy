@@ -491,7 +491,9 @@ async def handle_record_page(request: web.Request) -> web.Response:
     if not viewer or viewer.get("disabled"):
         return web.Response(status=403, text="A valid viewer token is required.")
     message = request.query.get("message", "")
-    initial_tab = "recordings" if request.query.get("tab") == "library" else "plan"
+    initial_tab = request.query.get("tab") or "plan"
+    if initial_tab not in ("plan", "library", "schedule"):
+        initial_tab = "plan"
     page_html = f"""<!doctype html><html lang="en"><meta name="viewport" content="width=device-width,initial-scale=1"><title>My Recordings · {html.escape(str(viewer.get("name", "Viewer")))}</title>
 <style>
 *{{box-sizing:border-box}}
@@ -543,7 +545,8 @@ footer.link a{{color:var(--rose-deep);text-decoration:none;font-weight:600}}
 </header>
 <nav class="nav-tabs" role="tablist">
   <button id="tab-plan" role="tab" aria-controls="panel-plan" aria-selected="{str(initial_tab == 'plan').lower()}">✿ Plan</button>
-  <button id="tab-library" role="tab" aria-controls="panel-library" aria-selected="{str(initial_tab != 'plan').lower()}">♥ Library</button>
+  <button id="tab-schedule" role="tab" aria-controls="panel-schedule" aria-selected="{str(initial_tab == 'schedule').lower()}">⏰ Schedule</button>
+  <button id="tab-library" role="tab" aria-controls="panel-library" aria-selected="{str(initial_tab == 'library').lower()}">♥ Library</button>
 </nav>
 <section id="panel-plan" class="panel{' active' if initial_tab == 'plan' else ''}" role="tabpanel" aria-labelledby="tab-plan">
   <div class="card">
@@ -568,7 +571,13 @@ footer.link a{{color:var(--rose-deep);text-decoration:none;font-weight:600}}
     </form>
   </div>
 </section>
-<section id="panel-library" class="panel{' active' if initial_tab != 'plan' else ''}" role="tabpanel" aria-labelledby="tab-library">
+<section id="panel-schedule" class="panel{' active' if initial_tab == 'schedule' else ''}" role="tabpanel" aria-labelledby="tab-schedule">
+  <div class="card">
+    <h2>Upcoming recordings</h2>
+    <div id="schedule">Loading…</div>
+  </div>
+</section>
+<section id="panel-library" class="panel{' active' if initial_tab == 'library' else ''}" role="tabpanel" aria-labelledby="tab-library">
   <div class="card">
     <h2>Your library</h2>
     <p class="record-toolbar"><label><input type='checkbox' id='select-all-recordings'> Select all</label> <button class='ghost' type='button' id='delete-selected-recordings'>Delete selected / all</button></p>
@@ -581,15 +590,34 @@ footer.link a{{color:var(--rose-deep);text-decoration:none;font-weight:600}}
 <script>
 (function(){{
   const tabs=document.querySelectorAll('.nav-tabs button');
-  const panels={{plan:document.getElementById('panel-plan'),library:document.getElementById('panel-library')}};
+  const panels={{plan:document.getElementById('panel-plan'),schedule:document.getElementById('panel-schedule'),library:document.getElementById('panel-library')}};
   function show(name){{
+    if(!panels[name])name='plan';
     tabs.forEach(t=>{{const on=t.id==='tab-'+name;t.classList.toggle('active',on);t.setAttribute('aria-selected',on);}});
-    panels.plan.classList.toggle('active',name==='plan');
-    panels.library.classList.toggle('active',name==='library');
+    Object.entries(panels).forEach(([k,el])=>el.classList.toggle('active',k===name));
     try{{history.replaceState(null,'','?tab='+name+(window.location.search.replace(/[?&]tab=[^&]*/,'')));}}catch(e){{}}
+    if(name==='schedule')loadSchedule();
   }}
   tabs.forEach(t=>t.addEventListener('click',()=>show(t.id.replace('tab-',''))));
   show({initial_tab!r});
+  if({initial_tab!r}==='schedule')loadSchedule();
+  function loadSchedule(){{
+    const box=document.getElementById('schedule');
+    if(!box)return;
+    box.innerHTML='Loading your upcoming recordings…';
+    fetch('/schedule/upcoming?token='+encodeURIComponent(token)).then(r=>r.json()).then(data=>{{
+      const items=data.items||[];
+      if(!items.length){{box.innerHTML='<p class="empty">Nothing scheduled yet. Tap “Plan” to set one up.</p>';return;}}
+      const now=Math.floor(Date.now()/1000);
+      box.innerHTML=items.map(it=>{{
+        const startsIn=it.start_at-now;
+        const human=startsIn>0?(startsIn>3600?'in '+Math.ceil(startsIn/3600)+' h':'in '+Math.ceil(startsIn/60)+' min'):'imminent';
+        const status='<span class="pill '+(it.status==="recording"?"err":(it.editable?"ok":"warn"))+'">'+(it.status==="recording"?"recording now":(human))+'</span>';
+        const edit=it.editable?'<a class="action" href="/schedule/'+it.id+'/edit?token='+encodeURIComponent(token)+'">✎ Edit</a>':'';
+        return '<article class="recording-card" data-id="'+it.id+'"><h3>'+(it.title.replace(/</g,'&lt;'))+'</h3><div class="meta"><span>📺 '+(it.channel.replace(/</g,'&lt;'))+'</span><span>⏱ '+it.length_minutes+' min</span>'+status+'</div><div class="times"><span>✦ '+it.start_local+'</span><span class="muted">→ '+it.end_local+'</span></div><div class="actions">'+edit+'</div></article>';
+      }}).join('');
+    }}).catch(()=>{{box.innerHTML='<p class="empty">Couldn\\u2019t load your schedule.</p>';}});
+  }}
 }})();
 const token={token!r},channel=document.getElementById('channel'),category=document.getElementById('category'),tzInput=document.getElementById('timezone'),tzHint=document.getElementById('tz-hint'),startInput=document.getElementById('start_at'),endInput=document.getElementById('end_at');let allChannels=[];const esc=s=>String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/"/g,'&quot;');let userZone='UTC';try{{userZone=Intl.DateTimeFormat().resolvedOptions().timeZone||'UTC'}}catch(e){{}}tzInput.value=userZone;tzHint.textContent='Detected from your device: '+userZone;const now=new Date();now.setMinutes(0,0,0);now.setHours(now.getHours()+1);const pad=n=>String(n).padStart(2,'0'),fmt=d=>d.getFullYear()+'-'+pad(d.getMonth()+1)+'-'+pad(d.getDate())+'T'+pad(d.getHours())+':'+pad(d.getMinutes());startInput.value=fmt(now);now.setHours(now.getHours()+1);endInput.value=fmt(now);Promise.all([fetch('/favorites?token='+encodeURIComponent(token)).then(r=>r.json()),fetch('/record/channels?token='+encodeURIComponent(token)).then(r=>r.json())]).then(([account,rows])=>{{const fav=new Set(account.slugs||[]);allChannels=rows;const groups=[...new Set(rows.map(c=>c.group))].sort((a,b)=>a.localeCompare(b));category.innerHTML=['<option value="__favorites">★ Favorites ('+fav.size+')</option>'].concat(groups.map(g=>'<option value="'+esc(g)+'">'+esc(g)+' ('+rows.filter(c=>c.group===g).length+')</option>')).join('');const renderChannels=list=>channel.innerHTML=list.map(c=>'<option value="'+c.id+'">'+esc(c.name)+'</option>').join('')||'<option value="">No channels in this category</option>';category.onchange=()=>{{const v=category.value;renderChannels(v==='__favorites'?rows.filter(c=>fav.has(c.slug)):rows.filter(c=>c.group===v));}};category.onchange();}});fetch('/recordings?token='+encodeURIComponent(token)).then(r=>r.json()).then(rows=>{{const box=document.getElementById('recordings');box.innerHTML=rows.map(r=>'<article class="recording-card"><h3>'+r.title.replace(/</g,'&lt;')+'</h3><video id="recording-'+r.id+'" controls preload="metadata"></video><br><a href="/recording/'+r.id+'.ts?token='+encodeURIComponent(token)+'" download>↓ Download</a></article>').join('')||'<p class="empty">No completed recordings yet — schedule one in the Plan tab.</p>';}}).catch(()=>{{document.getElementById('recordings').innerHTML='<p class="empty">Couldn\\u2019t load your library.</p>';}});
 </script>
@@ -661,6 +689,156 @@ async def handle_viewer_recordings_delete_all(request: web.Request) -> web.Respo
                     pass
             deleted += 1
     return web.json_response({"deleted": deleted})
+
+
+async def _schedule_resolve(request: web.Request) -> Optional[dict]:
+    token = request.query.get("token") or request.match_info.get("token", "")
+    viewer = await request.app["viewers"].get_by_token(token)
+    if not viewer or viewer.get("disabled"):
+        return None
+    return viewer
+
+
+async def _schedule_owner_check(request: web.Request, recording_id: int) -> Optional[dict]:
+    viewer = await _schedule_resolve(request)
+    if not viewer:
+        return None
+    recording = await request.app["recordings"].get(recording_id)
+    if not recording or recording["viewer_id"] != viewer["id"]:
+        return None
+    return recording
+
+
+def _format_ts(ts: float, timezone_name: str) -> str:
+    try:
+        return datetime.fromtimestamp(ts, ZoneInfo(timezone_name)).strftime("%a %d %b %Y, %H:%M")
+    except Exception:
+        return time.strftime("%Y-%m-%d %H:%M", time.localtime(ts))
+
+
+async def handle_schedule_upcoming(request: web.Request) -> web.Response:
+    viewer = await _schedule_resolve(request)
+    if not viewer:
+        return web.json_response({"error": "forbidden"}, status=403)
+    rows = await request.app["recordings"].list_all(viewer["id"])
+    now = time.time()
+    upcoming = [r for r in rows if r.get("status") in ("scheduled", "recording")]
+    upcoming.sort(key=lambda r: r["start_at"])
+    items = []
+    for r in upcoming:
+        channel = await request.app["channels"].get(r["channel_id"])
+        items.append({
+            "id": r["id"],
+            "title": r.get("title") or f"Recording #{r['id']}",
+            "channel": (channel or {}).get("display_name") or (channel or {}).get("slug") or f"Channel {r['channel_id']}",
+            "start_at": r["start_at"],
+            "end_at": r["end_at"],
+            "start_local": _format_ts(r["start_at"], r.get("timezone", "UTC")),
+            "end_local": _format_ts(r["end_at"], r.get("timezone", "UTC")),
+            "length_minutes": int((r["end_at"] - r["start_at"]) / 60),
+            "status": r["status"],
+            "editable": r["status"] == "scheduled" and r["start_at"] > now,
+        })
+    return web.json_response({"items": items})
+
+
+async def handle_schedule_delete(request: web.Request) -> web.Response:
+    recording = await _schedule_owner_check(request, int(request.match_info["id"]))
+    if not recording:
+        return web.json_response({"error": "forbidden"}, status=403)
+    if recording["status"] != "scheduled":
+        return web.json_response({"error": "recording-locked"}, status=409)
+    await request.app["recordings"].delete(recording["id"])
+    return web.json_response({"deleted": recording["id"]})
+
+
+def _schedule_edit_form(recording: dict, token: str) -> str:
+    start_local = _format_ts_for_input(recording["start_at"], recording.get("timezone", "UTC"))
+    end_local = _format_ts_for_input(recording["end_at"], recording.get("timezone", "UTC"))
+    return (
+        f"""<!doctype html><html lang="en"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Edit recording</title>"""
+        f"""<style>*{{box-sizing:border-box}}body{{margin:0;padding:1.25rem;background:linear-gradient(180deg,#fff7f3 0%,#fbeee7 60%,#f7dbe4 100%);color:#4a3340;font:16px/1.45 'Quicksand','Segoe UI',system-ui;min-height:100vh}}main{{max-width:520px;margin:0 auto;background:#ffffffe6;border:1px solid #f1d4dd;border-radius:24px;padding:1.5rem 1.2rem;box-shadow:0 10px 30px #d99bb022}}a.back{{display:inline-block;color:#b25e7c;text-decoration:none;font-weight:600;margin-bottom:.8rem}}h1{{margin:.2rem 0 1rem;font-weight:400;color:#b25e7c;font-size:1.5rem}}label{{display:block;margin:1rem 0 .35rem;font-size:.85rem;font-weight:600;color:#7a5e6e;letter-spacing:.04em;text-transform:uppercase}}input{{width:100%;padding:.85rem 1rem;border-radius:14px;border:1.5px solid #f1d4dd;background:#fffafc;color:#4a3340;font:.95rem inherit}}input:focus{{outline:0;border-color:#d99bb0;box-shadow:0 0 0 4px #f3bccf55}}.row{{display:flex;gap:.5rem;margin-top:1.4rem}}button{{flex:1;padding:.95rem;border:0;border-radius:999px;font:600 1rem 'Quicksand',sans-serif;cursor:pointer}}.save{{background:linear-gradient(135deg,#f3bccf,#d99bb0);color:#fff;box-shadow:0 8px 18px #d99bb066}}.del{{background:transparent;color:#b25e7c;border:1.5px solid #f1d4dd}}.msg{{padding:.8rem 1rem;border-radius:14px;margin-bottom:1rem}}.msg.ok{{background:#dceadc;border:1px solid #9bbf9b;color:#4f6a4f}}.msg.err{{background:#fde2e6;border:1px solid #d99bb0;color:#7a3e4e}}</style>"""
+        f"""<main><a class="back" href="/rec/{token!s}?tab=schedule">&laquo; Back to your schedule</a>"""
+        f"""<h1>Edit recording</h1>"""
+        f'<div id="msg"></div>'
+        f'<form id="edit-form">'
+        f'<input type="hidden" id="token" value="{html.escape(token, quote=True)}">'
+        f'<input type="hidden" id="recording_id" value="{recording["id"]}">'
+        f'<label>Title</label>'
+        f'<input id="title" value="{html.escape(recording.get("title", ""), quote=True)}">'
+        f'<label>Start</label>'
+        f'<input id="start_at" type="datetime-local" required value="{start_local}">'
+        f'<label>End</label>'
+        f'<input id="end_at" type="datetime-local" required value="{end_local}">'
+        f'<label>Timezone</label>'
+        f'<input id="timezone" readonly value="{html.escape(recording.get("timezone", "UTC"), quote=True)}">'
+        f'<div class="row"><button type="button" class="save" id="save">♥  Save changes</button>'
+        f'<button type="button" class="del" id="cancel">Remove</button></div>'
+        f'</form></main>'
+        f'<script>'
+        f'(function(){{'
+        f'const token=document.getElementById("token").value;'
+        f'const id=parseInt(document.getElementById("recording_id").value,10);'
+        f'const msg=document.getElementById("msg");'
+        f'function show(kind,text){{msg.innerHTML=\'<div class="msg \'+(kind==="ok"?"ok":"err")+\'">\'+text+\'</div>\'}}'
+        f'document.getElementById("save").onclick=async()=>{{'
+        f'document.getElementById("timezone").value=Intl.DateTimeFormat().resolvedOptions().timeZone||document.getElementById("timezone").value;'
+        f'const r=await fetch("/schedule/"+id+"/edit?token="+encodeURIComponent(token),{{method:"POST",headers:{{"Content-Type":"application/json"}},body:JSON.stringify({{title:document.getElementById("title").value,start_at:document.getElementById("start_at").value,end_at:document.getElementById("end_at").value,timezone:document.getElementById("timezone").value}})}});'
+        f'const j=await r.json();if(r.ok){{show("ok","Saved. Returning to your schedule…");setTimeout(()=>location.href="/rec/"+token+"?tab=schedule",900)}}else show("err",j.error||"Could not save.")'
+        f'}};'
+        f'document.getElementById("cancel").onclick=async()=>{{if(!confirm("Remove this scheduled recording?"))return;const r=await fetch("/schedule/"+id+"/delete?token="+encodeURIComponent(token),{{method:"POST"}});const j=await r.json();if(r.ok){{show("ok","Removed.");setTimeout(()=>location.href="/rec/"+token+"?tab=schedule",700)}}else show("err",j.error||"Could not remove.")}}'
+        f'}})();'
+        f'</script>'
+    )
+
+
+def _format_ts_for_input(ts: float, timezone_name: str) -> str:
+    try:
+        return datetime.fromtimestamp(ts, ZoneInfo(timezone_name)).strftime("%Y-%m-%dT%H:%M")
+    except Exception:
+        return time.strftime("%Y-%m-%dT%H:%M", time.localtime(ts))
+
+
+async def handle_schedule_edit_get(request: web.Request) -> web.Response:
+    recording = await _schedule_owner_check(request, int(request.match_info["id"]))
+    if not recording:
+        return web.Response(status=403, text="A valid viewer token is required.")
+    if recording["status"] != "scheduled":
+        return web.Response(status=409, text="Only scheduled recordings can be edited.")
+    token = request.query.get("token") or request.match_info.get("token", "")
+    return web.Response(
+        text=_schedule_edit_form(recording, token),
+        content_type="text/html",
+    )
+
+
+async def handle_schedule_edit_post(request: web.Request) -> web.Response:
+    recording = await _schedule_owner_check(request, int(request.match_info["id"]))
+    if not recording:
+        return web.json_response({"error": "forbidden"}, status=403)
+    if recording["status"] != "scheduled":
+        return web.json_response({"error": "recording-locked"}, status=409)
+    try:
+        data = await request.json()
+        zone_name = str(data.get("timezone") or recording.get("timezone", "UTC"))[:64]
+        zone = ZoneInfo(zone_name)
+        start = datetime.fromisoformat(str(data["start_at"])).replace(tzinfo=zone).timestamp()
+        end = datetime.fromisoformat(str(data["end_at"])).replace(tzinfo=zone).timestamp()
+        now = time.time()
+        if end <= start:
+            raise ValueError("end must be after start")
+        if end - start > 4 * 3600:
+            raise ValueError("recording too long (max 4 hours)")
+        if start < now - 60:
+            raise ValueError("start time cannot be in the past")
+        await request.app["recordings"].update(
+            recording["id"],
+            title=str(data.get("title") or recording.get("title") or "")[:200],
+            start_at=start, end_at=end, timezone=zone_name,
+        )
+        return web.json_response({"ok": True})
+    except (KeyError, TypeError, ValueError) as exc:
+        return web.json_response({"error": str(exc) or "invalid-input"}, status=422)
 
 
 async def handle_record_create(request: web.Request) -> web.Response:
@@ -946,6 +1124,10 @@ def _make_app(stores: dict, session: aiohttp.ClientSession) -> web.Application:
     app.router.add_post("/favorites", handle_favorites)
     app.router.add_get("/recordings", handle_viewer_recordings)
     app.router.add_post("/recordings/delete-all", handle_viewer_recordings_delete_all)
+    app.router.add_get("/schedule/upcoming", handle_schedule_upcoming)
+    app.router.add_post("/schedule/{id}/delete", handle_schedule_delete)
+    app.router.add_get("/schedule/{id}/edit", handle_schedule_edit_get)
+    app.router.add_post("/schedule/{id}/edit", handle_schedule_edit_post)
     app.router.add_get("/rec/{token}", handle_record_page)
     app.router.add_post("/rec/{token}", handle_record_create)
     app.router.add_get("/playlist.m3u", handle_playlist_m3u)
