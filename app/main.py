@@ -491,18 +491,114 @@ async def handle_record_page(request: web.Request) -> web.Response:
     if not viewer or viewer.get("disabled"):
         return web.Response(status=403, text="A valid viewer token is required.")
     message = request.query.get("message", "")
-    page_html = f"""<!doctype html><html lang="en"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Plan recording</title>
-<style>*{{box-sizing:border-box}}body{{margin:0;padding:1rem;background:#071426;color:#eaf7ff;font:16px system-ui}}main{{max-width:520px;margin:auto;width:100%}}section{{padding:1rem;background:#102943;border:1px solid #4385ad;border-radius:12px;overflow:hidden}}label{{display:block;margin:.8rem 0 .3rem;font-size:.9em;color:#9fc0d4}}input,select,button{{display:block;width:100%;max-width:100%;padding:.75rem;border-radius:7px;border:1px solid #5798bd;background:#06182b;color:inherit;font:inherit;min-width:0}}button{{margin-top:1rem;background:#168bd0;cursor:pointer;border:0}}input[type=datetime-local]{{min-height:2.8rem}}.msg{{padding:.7rem;background:#3d8a3d66;border-radius:7px}}.tz-hint{{font-size:.8em;color:#9fc0d4;margin:.3rem 0 0}}</style>
-<main><h1>Plan recording</h1><p>Viewer: {html.escape(str(viewer.get("name", "Viewer")))}</p><section>{f'<p class="msg">{html.escape(message)}</p>' if message else ''}<form method="post" action="/record"><input type="hidden" name="token" value="{html.escape(token, quote=True)}">
-<label>Category</label><select id="category" name="category"><option>Loading categories...</option></select>
-<label>Channel</label><select id="channel" name="channel_id" required><option>Loading channels...</option></select>
-<label>Title (optional)</label><input name="title" placeholder="Recording title">
-<label>Start</label><input name="start_at" id="start_at" type="datetime-local" required>
-<label>End</label><input name="end_at" id="end_at" type="datetime-local" required>
-<label>Timezone</label><input name="timezone" id="timezone" placeholder="Loading..." readonly><p class="tz-hint" id="tz-hint">Detected from your device.</p><button type="submit">Schedule recording</button></form></section><section><h2>Available recordings</h2><div id="recordings">Loading recordings...</div></section></main><script src="https://cdn.jsdelivr.net/npm/mpegts.js@1.8.0/dist/mpegts.min.js"></script>
-<script>const token={token!r},channel=document.getElementById('channel'),category=document.getElementById('category'),tzInput=document.getElementById('timezone'),tzHint=document.getElementById('tz-hint'),startInput=document.getElementById('start_at'),endInput=document.getElementById('end_at');let allChannels=[];const esc=s=>String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/"/g,'&quot;');let userZone='UTC';try{{userZone=Intl.DateTimeFormat().resolvedOptions().timeZone||'UTC'}}catch(e){{}}tzInput.value=userZone;tzHint.textContent='Detected from your device: '+userZone;const now=new Date();now.setMinutes(0,0,0);now.setHours(now.getHours()+1);const pad=n=>String(n).padStart(2,'0'),fmt=d=>d.getFullYear()+'-'+pad(d.getMonth()+1)+'-'+pad(d.getDate())+'T'+pad(d.getHours())+':'+pad(d.getMinutes());startInput.value=fmt(now);now.setHours(now.getHours()+1);endInput.value=fmt(now);Promise.all([fetch('/favorites?token='+encodeURIComponent(token)).then(r=>r.json()),fetch('/record/channels?token='+encodeURIComponent(token)).then(r=>r.json())]).then(([account,rows])=>{{const fav=new Set(account.slugs||[]);allChannels=rows;const groups=[...new Set(rows.map(c=>c.group))].sort((a,b)=>a.localeCompare(b));category.innerHTML=['<option value="__favorites">Favorites ('+fav.size+')</option>'].concat(groups.map(g=>'<option value="'+esc(g)+'">'+esc(g)+' ('+rows.filter(c=>c.group===g).length+')</option>')).join('');const renderChannels=list=>channel.innerHTML=list.map(c=>'<option value="'+c.id+'">'+esc(c.name)+'</option>').join('')||'<option value="">No channels in this category</option>';category.onchange=()=>{{const v=category.value;renderChannels(v==='__favorites'?rows.filter(c=>fav.has(c.slug)):rows.filter(c=>c.group===v));}};category.onchange();}});fetch('/recordings?token='+encodeURIComponent(token)).then(r=>r.json()).then(rows=>{{const box=document.getElementById('recordings');box.innerHTML=rows.map(r=>'<div><strong>'+r.title.replace(/</g,'&lt;')+'</strong><br><video id="recording-'+r.id+'" controls preload="metadata" style="width:100%"></video><a href="/recording/'+r.id+'.ts?token='+encodeURIComponent(token)+'" download>Download</a></div>').join('')||'<p>No completed recordings yet.</p>';rows.forEach(r=>{{const p=mpegts.createPlayer({{type:'mpegts',url:'/recording/'+r.id+'.ts?token='+encodeURIComponent(token),isLive:false}});p.attachMediaElement(document.getElementById('recording-'+r.id));p.load()}})}}).catch(()=>document.getElementById('recordings').textContent='Unable to load recordings')</script>"""
-    page_html = page_html.replace("<h2>Available recordings</h2>", "<h2>Available recordings</h2><p><label><input type='checkbox' id='select-all-recordings'> Select all</label> <button type='button' id='delete-selected-recordings'>Delete selected/all</button></p>", 1)
-    page_html = page_html.replace("</body>", "<script>const recordingBox=document.getElementById('recordings'),selectAll=document.getElementById('select-all-recordings'),deleteSelected=document.getElementById('delete-selected-recordings');const addRecordingSelectors=()=>recordingBox.querySelectorAll(':scope > div').forEach(card=>{if(card.querySelector('.recording-select'))return;const video=card.querySelector('video');if(!video)return;const id=video.id.replace('recording-','');const label=document.createElement('label');label.innerHTML='<input type=checkbox class=recording-select value='+id+'> Select';card.prepend(label,document.createElement('br'))});new MutationObserver(addRecordingSelectors).observe(recordingBox,{childList:true});selectAll.onchange=()=>recordingBox.querySelectorAll('.recording-select').forEach(x=>x.checked=selectAll.checked);deleteSelected.onclick=()=>{const ids=[...recordingBox.querySelectorAll('.recording-select:checked')].map(x=>Number(x.value));if(!confirm(ids.length?'Delete selected recordings?':'Delete all recordings?'))return;fetch('/recordings/delete-all?token='+encodeURIComponent(token),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ids})}).then(r=>r.json()).then(()=>location.reload())};addRecordingSelectors();</script></body>", 1)
+    initial_tab = "recordings" if request.query.get("tab") == "library" else "plan"
+    page_html = f"""<!doctype html><html lang="en"><meta name="viewport" content="width=device-width,initial-scale=1"><title>My Recordings · {html.escape(str(viewer.get("name", "Viewer")))}</title>
+<style>
+*{{box-sizing:border-box}}
+:root{{color-scheme:light;--rose:#d99bb0;--rose-soft:#f7dbe4;--rose-deep:#b25e7c;--cream:#fff7f3;--cream-soft:#fbeee7;--sage:#9bbf9b;--sage-soft:#dceadc;--ink:#4a3340;--ink-soft:#7a5e6e;--line:#f1d4dd;--line-strong:#e9b8c8}}
+html,body{{margin:0;padding:0;background:linear-gradient(180deg,#fff7f3 0%,#fbeee7 60%,#f7dbe4 100%);color:var(--ink);font:16px/1.45 'Quicksand','Segoe UI',system-ui,sans-serif;min-height:100vh}}
+body::before{{content:"";position:fixed;inset:0;pointer-events:none;opacity:.35;background:radial-gradient(circle at 20% 10%,#f9d6e0 0,transparent 45%),radial-gradient(circle at 80% 90%,#e6d8ee 0,transparent 55%)}}
+main{{max-width:560px;margin:0 auto;padding:1.25rem 1rem 4rem;position:relative}}
+header.hero{{padding:.6rem .2rem 1.2rem}}
+header.hero .greet{{font-size:.8rem;letter-spacing:.18em;text-transform:uppercase;color:var(--rose-deep);opacity:.8}}
+header.hero h1{{margin:.2rem 0 .2rem;font-weight:400;font-size:1.9rem;letter-spacing:.01em;color:var(--ink)}}
+header.hero .sub{{color:var(--ink-soft);font-size:.95rem}}
+.nav-tabs{{display:flex;gap:.4rem;padding:.4rem;border-radius:999px;background:#fff;border:1px solid var(--line);box-shadow:0 6px 18px #d99bb033;margin:1rem 0 1.2rem}}
+.nav-tabs button{{flex:1;padding:.7rem 1rem;border:0;border-radius:999px;background:transparent;color:var(--ink-soft);font:600 .95rem 'Quicksand',sans-serif;cursor:pointer;transition:all .25s ease}}
+.nav-tabs button.active{{background:linear-gradient(135deg,#f3bccf,#d99bb0);color:#fff;box-shadow:0 6px 14px #d99bb066}}
+.nav-tabs button:not(.active):hover{{color:var(--ink)}}
+.panel{{display:none;animation:fade .35s ease}}
+.panel.active{{display:block}}
+@keyframes fade{{from{{opacity:0;transform:translateY(6px)}}to{{opacity:1;transform:none}}}}
+.card{{background:#ffffffd9;backdrop-filter:blur(6px);border:1px solid var(--line);border-radius:24px;padding:1.4rem 1.2rem;box-shadow:0 10px 30px #d99bb022,0 2px 6px #c98a9d22;margin-bottom:1rem}}
+.card h2{{margin:0 0 1rem;font-weight:500;font-size:1.1rem;color:var(--rose-deep);display:flex;align-items:center;gap:.5rem}}
+.card h2::before{{content:"✿";color:var(--rose);font-size:1.1rem}}
+label{{display:block;margin:.9rem 0 .35rem;font-size:.85rem;font-weight:600;color:var(--ink-soft);letter-spacing:.04em;text-transform:uppercase}}
+input,select{{width:100%;max-width:100%;padding:.85rem 1rem;border-radius:14px;border:1.5px solid var(--line);background:#fffafc;color:var(--ink);font:500 .95rem inherit;min-width:0;transition:border-color .2s,box-shadow .2s}}
+input:focus,select:focus{{outline:0;border-color:var(--rose);box-shadow:0 0 0 4px #f3bccf55}}
+input[readonly]{{background:#faf0f3;color:var(--ink-soft)}}
+button.primary{{display:block;width:100%;padding:.95rem;margin-top:1.4rem;border:0;border-radius:999px;background:linear-gradient(135deg,#f3bccf,#d99bb0);color:#fff;font:600 1rem 'Quicksand',sans-serif;letter-spacing:.04em;cursor:pointer;box-shadow:0 8px 18px #d99bb066;transition:transform .15s,box-shadow .2s}}
+button.primary:hover{{transform:translateY(-1px);box-shadow:0 12px 24px #d99bb088}}
+button.primary:active{{transform:translateY(0)}}
+button.ghost{{padding:.6rem 1rem;border:1px solid var(--line);border-radius:999px;background:#fff;color:var(--rose-deep);font:600 .85rem 'Quicksand',sans-serif;cursor:pointer}}
+.tz-hint{{font-size:.8rem;color:var(--ink-soft);margin:.4rem 0 0}}
+.msg{{padding:.8rem 1rem;border-radius:14px;background:var(--sage-soft);border:1px solid var(--sage);color:#4f6a4f;margin-bottom:1rem}}
+.record-toolbar{{display:flex;align-items:center;justify-content:space-between;gap:.5rem;margin-bottom:1rem;flex-wrap:wrap}}
+.record-toolbar label{{display:inline-flex;align-items:center;gap:.4rem;margin:0;text-transform:none;letter-spacing:0;font-size:.85rem;color:var(--ink-soft);font-weight:500}}
+.recording-card{{background:#fff;border:1px solid var(--line);border-radius:18px;padding:1rem;margin-bottom:1rem;box-shadow:0 4px 12px #d99bb018}}
+.recording-card h3{{margin:0 0 .5rem;font-weight:500;font-size:1rem;color:var(--ink)}}
+.recording-card video{{width:100%;border-radius:12px;margin-top:.4rem;background:#000}}
+.recording-card a{{display:inline-block;margin-top:.6rem;padding:.45rem .9rem;border-radius:999px;background:var(--rose-soft);color:var(--rose-deep);text-decoration:none;font-weight:600;font-size:.85rem}}
+.empty{{text-align:center;padding:2rem 1rem;color:var(--ink-soft);font-style:italic}}
+footer.link{{position:fixed;bottom:0;left:0;right:0;padding:.7rem;text-align:center;background:linear-gradient(0deg,#fff7f3d9,#fff7f300);backdrop-filter:blur(8px);font-size:.85rem;color:var(--ink-soft)}}
+footer.link a{{color:var(--rose-deep);text-decoration:none;font-weight:600}}
+@media (prefers-reduced-motion:reduce){{*{{animation:none!important;transition:none!important}}}}
+</style>
+</head><body>
+<main>
+<header class="hero">
+  <div class="greet">Hello</div>
+  <h1>{html.escape(str(viewer.get("name", "Viewer")))}</h1>
+  <div class="sub">Plan a recording, or browse what you've already captured.</div>
+</header>
+<nav class="nav-tabs" role="tablist">
+  <button id="tab-plan" role="tab" aria-controls="panel-plan" aria-selected="{str(initial_tab == 'plan').lower()}">✿ Plan</button>
+  <button id="tab-library" role="tab" aria-controls="panel-library" aria-selected="{str(initial_tab != 'plan').lower()}">♥ Library</button>
+</nav>
+<section id="panel-plan" class="panel{' active' if initial_tab == 'plan' else ''}" role="tabpanel" aria-labelledby="tab-plan">
+  <div class="card">
+    <h2>Schedule a new recording</h2>
+    {f'<p class="msg">{html.escape(message)}</p>' if message else ''}
+    <form method="post" action="/record">
+      <input type="hidden" name="token" value="{html.escape(token, quote=True)}">
+      <label>Category</label>
+      <select id="category" name="category"><option>Loading categories…</option></select>
+      <label>Channel</label>
+      <select id="channel" name="channel_id" required><option>Loading channels…</option></select>
+      <label>Title <span style="font-weight:400;text-transform:none;letter-spacing:0;color:var(--ink-soft)">(optional)</span></label>
+      <input name="title" placeholder="e.g. Morning news">
+      <label>Start</label>
+      <input name="start_at" id="start_at" type="datetime-local" required>
+      <label>End</label>
+      <input name="end_at" id="end_at" type="datetime-local" required>
+      <label>Timezone</label>
+      <input name="timezone" id="timezone" placeholder="Detecting…" readonly>
+      <p class="tz-hint" id="tz-hint">Detected from your device.</p>
+      <button class="primary" type="submit">♥  Save recording</button>
+    </form>
+  </div>
+</section>
+<section id="panel-library" class="panel{' active' if initial_tab != 'plan' else ''}" role="tabpanel" aria-labelledby="tab-library">
+  <div class="card">
+    <h2>Your library</h2>
+    <p class="record-toolbar"><label><input type='checkbox' id='select-all-recordings'> Select all</label> <button class='ghost' type='button' id='delete-selected-recordings'>Delete selected / all</button></p>
+    <div id="recordings">Loading recordings…</div>
+  </div>
+</section>
+</main>
+<footer class="link">Made with ✿ for {html.escape(str(viewer.get("name", "Viewer")))}</footer>
+<script src="https://cdn.jsdelivr.net/npm/mpegts.js@1.8.0/dist/mpegts.min.js"></script>
+<script>
+(function(){{
+  const tabs=document.querySelectorAll('.nav-tabs button');
+  const panels={{plan:document.getElementById('panel-plan'),library:document.getElementById('panel-library')}};
+  function show(name){{
+    tabs.forEach(t=>{{const on=t.id==='tab-'+name;t.classList.toggle('active',on);t.setAttribute('aria-selected',on);}});
+    panels.plan.classList.toggle('active',name==='plan');
+    panels.library.classList.toggle('active',name==='library');
+    try{{history.replaceState(null,'','?tab='+name+(window.location.search.replace(/[?&]tab=[^&]*/,'')));}}catch(e){{}}
+  }}
+  tabs.forEach(t=>t.addEventListener('click',()=>show(t.id.replace('tab-',''))));
+  show({initial_tab!r});
+}})();
+const token={token!r},channel=document.getElementById('channel'),category=document.getElementById('category'),tzInput=document.getElementById('timezone'),tzHint=document.getElementById('tz-hint'),startInput=document.getElementById('start_at'),endInput=document.getElementById('end_at');let allChannels=[];const esc=s=>String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/"/g,'&quot;');let userZone='UTC';try{{userZone=Intl.DateTimeFormat().resolvedOptions().timeZone||'UTC'}}catch(e){{}}tzInput.value=userZone;tzHint.textContent='Detected from your device: '+userZone;const now=new Date();now.setMinutes(0,0,0);now.setHours(now.getHours()+1);const pad=n=>String(n).padStart(2,'0'),fmt=d=>d.getFullYear()+'-'+pad(d.getMonth()+1)+'-'+pad(d.getDate())+'T'+pad(d.getHours())+':'+pad(d.getMinutes());startInput.value=fmt(now);now.setHours(now.getHours()+1);endInput.value=fmt(now);Promise.all([fetch('/favorites?token='+encodeURIComponent(token)).then(r=>r.json()),fetch('/record/channels?token='+encodeURIComponent(token)).then(r=>r.json())]).then(([account,rows])=>{{const fav=new Set(account.slugs||[]);allChannels=rows;const groups=[...new Set(rows.map(c=>c.group))].sort((a,b)=>a.localeCompare(b));category.innerHTML=['<option value="__favorites">★ Favorites ('+fav.size+')</option>'].concat(groups.map(g=>'<option value="'+esc(g)+'">'+esc(g)+' ('+rows.filter(c=>c.group===g).length+')</option>')).join('');const renderChannels=list=>channel.innerHTML=list.map(c=>'<option value="'+c.id+'">'+esc(c.name)+'</option>').join('')||'<option value="">No channels in this category</option>';category.onchange=()=>{{const v=category.value;renderChannels(v==='__favorites'?rows.filter(c=>fav.has(c.slug)):rows.filter(c=>c.group===v));}};category.onchange();}});fetch('/recordings?token='+encodeURIComponent(token)).then(r=>r.json()).then(rows=>{{const box=document.getElementById('recordings');box.innerHTML=rows.map(r=>'<article class="recording-card"><h3>'+r.title.replace(/</g,'&lt;')+'</h3><video id="recording-'+r.id+'" controls preload="metadata"></video><br><a href="/recording/'+r.id+'.ts?token='+encodeURIComponent(token)+'" download>↓ Download</a></article>').join('')||'<p class="empty">No completed recordings yet — schedule one in the Plan tab.</p>';}}).catch(()=>{{document.getElementById('recordings').innerHTML='<p class="empty">Couldn\\u2019t load your library.</p>';}});
+</script>
+<script>
+const recordingBox=document.getElementById('recordings'),selectAll=document.getElementById('select-all-recordings'),deleteSelected=document.getElementById('delete-selected-recordings');const addRecordingSelectors=()=>recordingBox.querySelectorAll(':scope > article').forEach(card=>{{if(card.querySelector('.recording-select'))return;const video=card.querySelector('video');if(!video)return;const id=video.id.replace('recording-','');const label=document.createElement('label');label.innerHTML='<input type=checkbox class=recording-select value='+id+'> Select';card.prepend(label)}});new MutationObserver(addRecordingSelectors).observe(recordingBox,{{childList:true}});selectAll.onchange=()=>recordingBox.querySelectorAll('.recording-select').forEach(x=>x.checked=selectAll.checked);deleteSelected.onclick=()=>{{const ids=[...recordingBox.querySelectorAll('.recording-select:checked')].map(x=>Number(x.value));if(!confirm(ids.length?'Delete selected recordings?':'Delete all recordings?'))return;const payload=Object.create(null);payload.ids=ids;fetch('/recordings/delete-all?token='+encodeURIComponent(token),{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(payload)}}).then(r=>r.json()).then(()=>location.reload())}};addRecordingSelectors();
+</script>
+"""
+
+
     return web.Response(text=page_html, content_type="text/html")
 
 
