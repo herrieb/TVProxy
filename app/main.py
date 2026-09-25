@@ -81,6 +81,11 @@ CHUNK_SIZE = 16 * 1024
 
 DB_PATH = os.environ.get("TVPROXY_DB_PATH", "/var/lib/tv-proxy/mappings.db")
 
+MOVIE_EXTENSIONS = (
+    ".avi", ".mp4", ".mkv", ".ts", ".mov", ".m4v", ".flv",
+    ".webm", ".mpg", ".mpeg", ".wmv", ".divx", ".vob",
+)
+
 FORWARD_HEADERS = (
     "user-agent",
     "accept",
@@ -119,8 +124,131 @@ def _configure_logging() -> None:
 # Public streaming routes
 # ---------------------------------------------------------------------------
 
+_MOVIE_CACHE: dict = {"stamp": 0.0, "files": []}
+MOVIE_CACHE_SECONDS = 60
+
+
+async def _scan_movies(movie_root: str) -> list[dict]:
+    """Return sorted video files under movie_root (cached briefly)."""
+    if not movie_root or not os.path.isdir(movie_root):
+        return []
+    now = time.time()
+    if now - _MOVIE_CACHE["stamp"] < MOVIE_CACHE_SECONDS:
+        return _MOVIE_CACHE["files"]
+    real_root = os.path.realpath(movie_root)
+
+    def walk():
+        found = []
+        for dirpath, dirnames, filenames in os.walk(movie_root):
+            dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+            for fn in filenames:
+                if fn.startswith("."):
+                    continue
+                if fn.lower().endswith(MOVIE_EXTENSIONS):
+                    full = os.path.join(dirpath, fn)
+                    if os.path.commonpath((real_root, os.path.realpath(full))) != real_root:
+                        continue
+                    found.append({
+                        "path": full,
+                        "name": os.path.splitext(fn)[0],
+                        "filename": fn,
+                        "size": os.path.getsize(full),
+                        "mtime": os.path.getmtime(full),
+                    })
+        found.sort(key=lambda f: f["name"].lower())
+        return found
+
+    try:
+        files = await asyncio.to_thread(walk)
+    except OSError:
+        return []
+    _MOVIE_CACHE["stamp"] = now
+    _MOVIE_CACHE["files"] = files
+    return files
+
+
+def _guess_mime(path: str) -> str:
+    ext = os.path.splitext(path)[1].lower()
+    return {
+        ".mp4": "video/mp4", ".m4v": "video/mp4", ".mov": "video/quicktime",
+        ".mkv": "video/x-matroska", ".avi": "video/x-msvideo", ".ts": "video/mp2t",
+        ".webm": "video/webm", ".flv": "video/x-flv", ".wmv": "video/x-ms-wmv",
+        ".mpg": "video/mpeg", ".mpeg": "video/mpeg", ".divx": "video/x-divx",
+        ".vob": "video/mpeg",
+    }.get(ext, "application/octet-stream")
+
+
+async def handle_movie_list(request: web.Request) -> web.Response:
+    token = request.query.get("token") or ""
+    viewer = await request.app["viewers"].get_by_token(token)
+    if not viewer or viewer.get("disabled"):
+        return web.json_response({"error": "forbidden"}, status=403)
+    movie_root = (await request.app["settings_store"].get("movie_dir")) or ""
+    files = await _scan_movies(movie_root)
+    return web.json_response([
+        {"id": i, "name": f["name"], "filename": f["filename"], "size": f["size"]}
+        for i, f in enumerate(files)
+    ])
+
+
+async def handle_movie_file(request: web.Request) -> web.StreamResponse:
+    token = request.query.get("token") or ""
+    viewer = await request.app["viewers"].get_by_token(token)
+    if not viewer or viewer.get("disabled"):
+        return web.Response(status=403, text="Forbidden")
+    try:
+        movie_id = int(request.match_info["id"])
+    except ValueError:
+        return web.Response(status=404, text="Not found")
+    movie_root = (await request.app["settings_store"].get("movie_dir")) or ""
+    files = await _scan_movies(movie_root)
+    if movie_id < 0 or movie_id >= len(files):
+        return web.Response(status=404, text="Not found")
+    path = files[movie_id]["path"]
+    real_root = os.path.realpath(movie_root)
+    if os.path.commonpath((real_root, os.path.realpath(path))) != real_root or not os.path.isfile(path):
+        return web.Response(status=404, text="Not found")
+    size = os.path.getsize(path)
+    start, end = 0, size - 1
+    range_header = request.headers.get("Range", "")
+    if range_header.startswith("bytes="):
+        first, _, last = range_header[6:].split(",", 1)[0].partition("-")
+        try:
+            start = int(first) if first else max(0, size - int(last))
+            end = int(last) if first and last else size - 1
+            if start < 0 or start > end or end >= size:
+                raise ValueError
+        except ValueError:
+            return web.Response(status=416, headers={"Content-Range": f"bytes */{size}"})
+    response = web.StreamResponse(status=206 if range_header else 200, headers={
+        "Content-Type": _guess_mime(path), "Accept-Ranges": "bytes",
+        "Content-Length": str(end - start + 1),
+        **({"Content-Range": f"bytes {start}-{end}/{size}"} if range_header else {}),
+    })
+    await response.prepare(request)
+    try:
+        with open(path, "rb") as movie_file:
+            movie_file.seek(start)
+            remaining = end - start + 1
+            while remaining:
+                chunk = movie_file.read(min(1024 * 1024, remaining))
+                if not chunk:
+                    break
+                await response.write(chunk)
+                remaining -= len(chunk)
+    except ConnectionResetError:
+        return response
+    await response.write_eof()
+    return response
+
 
 async def handle_root(request: web.Request) -> web.Response:
+    from .admin import _authenticate, _is_browser
+    user = await _authenticate(request, request.app["admin_users"])
+    if user:
+        raise web.HTTPFound("/admin/dashboard")
+    if _is_browser(request):
+        raise web.HTTPFound("/admin/login")
     return web.Response(
         text="TVProxy IPTV Proxy\nStatus: running\n",
         content_type="text/plain",
@@ -368,12 +496,13 @@ async def handle_record_page(request: web.Request) -> web.Response:
     page_html = f"""<!doctype html><html lang="en"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Plan recording</title>
 <style>body{{margin:0;padding:1rem;background:#071426;color:#eaf7ff;font:16px system-ui}}main{{max-width:520px;margin:auto}}section{{padding:1rem;background:#102943;border:1px solid #4385ad;border-radius:12px}}label{{display:block;margin:.8rem 0 .3rem}}input,select,button{{width:100%;padding:.75rem;border-radius:7px;border:1px solid #5798bd;background:#06182b;color:inherit;font:inherit}}button{{margin-top:1rem;background:#168bd0;cursor:pointer}}.msg{{padding:.7rem;background:#3d8a3d66;border-radius:7px}}</style>
 <main><h1>Plan recording</h1><p>Viewer: {html.escape(str(viewer.get("name", "Viewer")))}</p><section>{f'<p class="msg">{html.escape(message)}</p>' if message else ''}<form method="post" action="/record"><input type="hidden" name="token" value="{html.escape(token, quote=True)}">
+<label>Category</label><select id="category" name="category"><option>Loading categories...</option></select>
 <label>Channel</label><select id="channel" name="channel_id" required><option>Loading channels...</option></select>
 <label>Title (optional)</label><input name="title" placeholder="Recording title">
 <label>Start</label><input name="start_at" type="datetime-local" value="{next_hour.strftime('%Y-%m-%dT%H:%M')}" required>
 <label>End</label><input name="end_at" type="datetime-local" value="{(next_hour + timedelta(hours=1)).strftime('%Y-%m-%dT%H:%M')}" required>
 <label>Timezone</label><input name="timezone" value="{zone_name}" required><button type="submit">Schedule recording</button></form></section><section><h2>Available recordings</h2><div id="recordings">Loading recordings...</div></section></main><script src="https://cdn.jsdelivr.net/npm/mpegts.js@1.8.0/dist/mpegts.min.js"></script>
-<script>const token={token!r},channel=document.getElementById('channel');document.querySelector('[name=timezone]').value=Intl.DateTimeFormat().resolvedOptions().timeZone||'UTC';const now=new Date();now.setMinutes(0,0,0);now.setHours(now.getHours()+1);const pad=n=>String(n).padStart(2,'0'),fmt=d=>d.getFullYear()+'-'+pad(d.getMonth()+1)+'-'+pad(d.getDate())+'T'+pad(d.getHours())+':'+pad(d.getMinutes());document.querySelector('[name=start_at]').value=fmt(now);now.setHours(now.getHours()+1);document.querySelector('[name=end_at]').value=fmt(now);fetch('/favorites?token='+encodeURIComponent(token)).then(r=>r.json()).then(account=>fetch('/record/channels?token='+encodeURIComponent(token)).then(r=>r.json()).then(rows=>{{const fav=new Set(account.slugs||[]),filtered=rows.filter(c=>fav.has(c.slug));channel.innerHTML=filtered.map(c=>'<option value="'+c.id+'">'+c.name.replace(/&/g,'&amp;').replace(/</g,'&lt;')+'</option>').join('')||'<option value="">No favorites saved</option>'}}));fetch('/recordings?token='+encodeURIComponent(token)).then(r=>r.json()).then(rows=>{{const box=document.getElementById('recordings');box.innerHTML=rows.map(r=>'<div><strong>'+r.title.replace(/</g,'&lt;')+'</strong><br><video id="recording-'+r.id+'" controls preload="metadata" style="width:100%"></video><a href="/recording/'+r.id+'.ts?token='+encodeURIComponent(token)+'" download>Download</a></div>').join('')||'<p>No completed recordings yet.</p>';rows.forEach(r=>{{const p=mpegts.createPlayer({{type:'mpegts',url:'/recording/'+r.id+'.ts?token='+encodeURIComponent(token),isLive:false}});p.attachMediaElement(document.getElementById('recording-'+r.id));p.load()}})}}).catch(()=>document.getElementById('recordings').textContent='Unable to load recordings')</script>"""
+<script>const token={token!r},channel=document.getElementById('channel'),category=document.getElementById('category');let allChannels=[];const esc=s=>String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/"/g,'&quot;');document.querySelector('[name=timezone]').value=Intl.DateTimeFormat().resolvedOptions().timeZone||'UTC';const now=new Date();now.setMinutes(0,0,0);now.setHours(now.getHours()+1);const pad=n=>String(n).padStart(2,'0'),fmt=d=>d.getFullYear()+'-'+pad(d.getMonth()+1)+'-'+pad(d.getDate())+'T'+pad(d.getHours())+':'+pad(d.getMinutes());document.querySelector('[name=start_at]').value=fmt(now);now.setHours(now.getHours()+1);document.querySelector('[name=end_at]').value=fmt(now);Promise.all([fetch('/favorites?token='+encodeURIComponent(token)).then(r=>r.json()),fetch('/record/channels?token='+encodeURIComponent(token)).then(r=>r.json())]).then(([account,rows])=>{{const fav=new Set(account.slugs||[]);allChannels=rows;const groups=[...new Set(rows.map(c=>c.group))].sort((a,b)=>a.localeCompare(b));category.innerHTML=['<option value="__favorites">Favorites ('+fav.size+')</option>'].concat(groups.map(g=>'<option value="'+esc(g)+'">'+esc(g)+' ('+rows.filter(c=>c.group===g).length+')</option>')).join('');const renderChannels=list=>channel.innerHTML=list.map(c=>'<option value="'+c.id+'">'+esc(c.name)+'</option>').join('')||'<option value="">No channels in this category</option>';category.onchange=()=>{{const v=category.value;renderChannels(v==='__favorites'?rows.filter(c=>fav.has(c.slug)):rows.filter(c=>c.group===v));}};category.onchange();}});fetch('/recordings?token='+encodeURIComponent(token)).then(r=>r.json()).then(rows=>{{const box=document.getElementById('recordings');box.innerHTML=rows.map(r=>'<div><strong>'+r.title.replace(/</g,'&lt;')+'</strong><br><video id="recording-'+r.id+'" controls preload="metadata" style="width:100%"></video><a href="/recording/'+r.id+'.ts?token='+encodeURIComponent(token)+'" download>Download</a></div>').join('')||'<p>No completed recordings yet.</p>';rows.forEach(r=>{{const p=mpegts.createPlayer({{type:'mpegts',url:'/recording/'+r.id+'.ts?token='+encodeURIComponent(token),isLive:false}});p.attachMediaElement(document.getElementById('recording-'+r.id));p.load()}})}}).catch(()=>document.getElementById('recordings').textContent='Unable to load recordings')</script>"""
     page_html = page_html.replace("<h2>Available recordings</h2>", "<h2>Available recordings</h2><p><label><input type='checkbox' id='select-all-recordings'> Select all</label> <button type='button' id='delete-selected-recordings'>Delete selected/all</button></p>", 1)
     page_html = page_html.replace("</body>", "<script>const recordingBox=document.getElementById('recordings'),selectAll=document.getElementById('select-all-recordings'),deleteSelected=document.getElementById('delete-selected-recordings');const addRecordingSelectors=()=>recordingBox.querySelectorAll(':scope > div').forEach(card=>{if(card.querySelector('.recording-select'))return;const video=card.querySelector('video');if(!video)return;const id=video.id.replace('recording-','');const label=document.createElement('label');label.innerHTML='<input type=checkbox class=recording-select value='+id+'> Select';card.prepend(label,document.createElement('br'))});new MutationObserver(addRecordingSelectors).observe(recordingBox,{childList:true});selectAll.onchange=()=>recordingBox.querySelectorAll('.recording-select').forEach(x=>x.checked=selectAll.checked);deleteSelected.onclick=()=>{const ids=[...recordingBox.querySelectorAll('.recording-select:checked')].map(x=>Number(x.value));if(!confirm(ids.length?'Delete selected recordings?':'Delete all recordings?'))return;fetch('/recordings/delete-all?token='+encodeURIComponent(token),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ids})}).then(r=>r.json()).then(()=>location.reload())};addRecordingSelectors();</script></body>", 1)
     return web.Response(text=page_html, content_type="text/html")
@@ -387,7 +516,7 @@ async def handle_record_channels(request: web.Request) -> web.Response:
     channels = await request.app["channels"].list_all()
     if allowed:
         channels = [c for c in channels if c["id"] in allowed]
-    return web.json_response([{"id": c["id"], "slug": c["slug"], "name": c.get("display_name") or c.get("slug")} for c in channels])
+    return web.json_response([{"id": c["id"], "slug": c["slug"], "name": c.get("display_name") or c.get("slug"), "group": c.get("description") or "Other"} for c in channels])
 
 
 async def handle_favorites(request: web.Request) -> web.Response:
@@ -536,99 +665,8 @@ async def handle_playlist(request: web.Request, session: aiohttp.ClientSession):
         return web.json_response({"error": "upstream-fetch-fail"}, status=502)
 
     try:
-        if resp.status != 200:
+        if resp.status not in (200, 206):
             logger.warning("upstream-fetch-fail slug=%s code=%s", slug, resp.status)
-            return web.json_response({"error": "upstream-non-200"}, status=502)
-        final_url = str(resp.url)
-        final_host = safe_host(final_url)
-        ok, reason = validate_upstream_url_runtime(final_url, final_host)
-        if not ok:
-            logger.warning("upstream-redirect-reject reason=%s slug=%s", reason, slug)
-            return web.json_response({"error": "upstream-redirect-blocked"}, status=502)
-        ctype = resp.headers.get("Content-Type", "")
-        if not looks_like_playlist(upstream_url, ctype):
-            out = web.StreamResponse(status=resp.status)
-            for key in ("content-type", "content-length", "content-range",
-                        "accept-ranges", "last-modified", "etag", "cache-control"):
-                if key in resp.headers:
-                    out.headers[key] = resp.headers[key]
-            await out.prepare(request)
-            try:
-                async for chunk in resp.content.iter_chunked(CHUNK_SIZE):
-                    await out.write(chunk)
-            except (ConnectionResetError, aiohttp.ClientConnectionResetError):
-                logger.info("viewer-disconnected slug=%s", slug)
-            return out
-        body = await resp.text()
-    finally:
-        await resp.release()
-
-    proxy_base = f"{str(request.scheme)}://{request.host}/proxy"
-    rewritten = rewrite_playlist(body, str(resp.url), proxy_base, token)
-
-    # Record session: mark this viewer as currently active.
-    sessions = request.app["sessions"]
-    sessions.touch(viewer["id"], channel["id"], request, started_at=None)
-
-    return web.Response(
-        text=rewritten,
-        content_type="application/vnd.apple.mpegurl",
-        charset="utf-8",
-    )
-
-
-async def handle_segment(request: web.Request, session: aiohttp.ClientSession):
-    viewers = request.app["viewers"]
-    token = request.query.get("token") or ""
-    viewer = None
-    if token:
-        viewer = await viewers.get_by_token(token)
-
-    if not viewer or viewer.get("disabled"):
-        return web.json_response({"error": "forbidden"}, status=403)
-
-    target = request.query.get("upstream", "")
-    if not target:
-        return web.json_response({"error": "missing-upstream"}, status=400)
-
-    # Verify target's host is in one of the connection allowlists.
-    target_host = safe_host(target)
-    connections = await request.app["connections"].list_all()
-    conn = None
-    for c in connections:
-        if c.get("enabled") and c["allowed_host"].lower() == target_host.lower():
-            conn = c
-            break
-    if conn is None:
-        return web.json_response({"error": "upstream-blocked"}, status=403)
-
-    ok, reason = validate_upstream_url_runtime(target, target_host)
-    if not ok:
-        return web.json_response({"error": "upstream-blocked"}, status=403)
-
-    headers = {
-        k: v for k, v in request.headers.items() if k.lower() in FORWARD_HEADERS
-    }
-    if conn.get("auth_header"):
-        headers["Authorization"] = conn["auth_header"]
-
-    timeout = aiohttp.ClientTimeout(
-        sock_connect=UPSTREAM_CONNECT_TIMEOUT,
-        sock_read=UPSTREAM_READ_TIMEOUT,
-    )
-    try:
-        resp = await session.get(
-            target, headers=headers, allow_redirects=True,
-            timeout=timeout, auto_decompress=False,
-        )
-    except aiohttp.ClientError as exc:
-        logger.warning(
-            "upstream-connect-fail url=%s err=%s", target_host, type(exc).__name__
-        )
-        return web.json_response({"error": "upstream-fetch-fail"}, status=502)
-
-    try:
-        if resp.status >= 400:
             return web.json_response({"error": "upstream-non-2xx"}, status=502)
         final_url = str(resp.url)
         final_host = safe_host(final_url)
@@ -637,7 +675,7 @@ async def handle_segment(request: web.Request, session: aiohttp.ClientSession):
             return web.json_response({"error": "upstream-redirect-blocked"}, status=502)
 
         ctype = resp.headers.get("Content-Type", "")
-        if looks_like_playlist(target, ctype):
+        if looks_like_playlist(upstream_url, ctype):
             body = await resp.text()
             proxy_base = f"{str(request.scheme)}://{request.host}/proxy"
             rewritten = rewrite_playlist(body, str(resp.url), proxy_base, token)
@@ -688,12 +726,21 @@ async def handle_playlist_m3u(request: web.Request):
         recording["external_filename"] = os.path.basename(recording["local_path"])
 
     public_url = (await settings_store.get("public_url")) or "https://tv.berrie.uk"
+    original_urls = ((await settings_store.get("m3u_original_urls")) or "0") == "1"
+    movie_root = (await settings_store.get("movie_dir")) or ""
+    movie_files = await _scan_movies(movie_root)
+    movies = [{
+        "slug": f"movie-{i}",
+        "display_name": f["name"],
+        "url": f"{public_url.rstrip('/')}/movie/{i}?token={quote(viewer['token'], safe='')}",
+    } for i, f in enumerate(movie_files)]
     from .streaming import generate_user_m3u
     m3u = generate_user_m3u(
         public_url, channels, viewer["token"], viewer.get("short_code") if short_code else None, recordings,
         os.environ.get("TVPROXY_LOCAL_RECORDING_URL", "http://192.168.178.217:8081"),
         os.environ.get("TVPROXY_EXTERNAL_RECORDING_URL", "https://filesharez.berrie.uk/iptv"),
         os.environ.get("TVPROXY_EXTERNAL_RECORDING_TOKEN", ""),
+        movies=movies, original_urls=original_urls,
     )
     return web.Response(text=m3u, content_type="audio/x-mpegurl")
 
@@ -810,6 +857,8 @@ def _make_app(stores: dict, session: aiohttp.ClientSession) -> web.Application:
     app.router.add_get("/playlist.m3u", handle_playlist_m3u)
     app.router.add_get("/tv/{code}", handle_playlist_m3u)
     app.router.add_get("/recording/{id}.ts", handle_recording_file)
+    app.router.add_get("/movies/list", handle_movie_list)
+    app.router.add_get("/movie/{id}", handle_movie_file)
     app.router.add_get(
         "/live/{name:.+\\.m3u8}",
         lambda r: handle_playlist(r, session),

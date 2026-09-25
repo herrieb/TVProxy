@@ -195,11 +195,17 @@ def generate_user_m3u(
     local_recording_url: str = "",
     external_recording_url: str = "",
     external_recording_token: str = "",
+    movies: Optional[list[dict]] = None,
+    original_urls: bool = False,
 ) -> str:
     """Render a per-viewer M3U pointing at the proxy's /playlist URLs.
 
     Each entry is an #EXTINF followed by a URL of the form:
       <public_url>/live/<slug>.m3u8?token=<token>
+
+    When original_urls is True, live entries use the channel's upstream
+    URL instead of the proxy URL, so viewers fetch directly from the
+    provider.  Movies (if given) use the proxy's /movie/<id> route.
     """
     out = ["#EXTM3U"]
     for ch in channels:
@@ -215,12 +221,19 @@ def generate_user_m3u(
         attr_str = " ".join(attrs)
         name = (ch.get("display_name") or ch.get("slug") or "Channel").replace("\r", " ").replace("\n", " ")
         slug = ch.get("slug") or ""
-        if short_code:
+        upstream = str(ch.get("upstream_path") or "")
+        if original_urls and upstream.startswith(("http://", "https://")):
+            url = upstream
+        elif short_code:
             url = f"{public_url.rstrip('/')}/tv/{quote(short_code, safe='')}/{quote(slug, safe='')}.m3u8"
         else:
             url = f"{public_url.rstrip('/')}/live/{quote(slug, safe='')}.m3u8?token={quote(token, safe='')}"
         out.append(f"#EXTINF:-1 {attr_str},{name}")
         out.append(url)
+    for movie in movies or []:
+        name = (movie.get("display_name") or "Movie").replace("\r", " ").replace("\n", " ")
+        out.append(f'#EXTINF:-1 group-title="Movies",{_escape_attr(name)}')
+        out.append(movie["url"])
     for recording in recordings or []:
         name = (recording.get("title") or f"Recording {recording.get('id', '')}").replace("\r", " ").replace("\n", " ")
         filename = recording.get("external_filename") or ""

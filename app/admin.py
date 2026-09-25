@@ -120,6 +120,25 @@ _HTML_HEAD = """<!doctype html>
 </style>
 </head>
 <body>
+<script>
+document.addEventListener('click', function(e) {
+  var b = e.target.closest('.copy-rec');
+  if (!b) return;
+  var t = document.getElementById(b.dataset.target);
+  if (!t) return;
+  var done = function() {
+    var old = b.textContent;
+    b.textContent = 'Copied';
+    b.disabled = true;
+    setTimeout(function() { b.textContent = old; b.disabled = false; }, 1800);
+  };
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(t.value).then(done, done);
+  } else {
+    t.select(); document.execCommand('copy'); done();
+  }
+});
+</script>
 """
 
 
@@ -669,7 +688,9 @@ async def admin_connections_get(request: web.Request) -> web.Response:
     playlist_cards = ""
     for viewer in viewers:
         playlist_url = f'{public_url.rstrip("/")}/tv/{viewer.get("short_code")}' if viewer.get("short_code") and viewer.get("short_enabled", 1) else f'{public_url.rstrip("/")}/playlist.m3u?token={viewer["token"]}'
+        rec_url = f'{public_url.rstrip("/")}/rec/{viewer["token"]}'
         field_id = f'playlist-url-{viewer["id"]}'
+        rec_field_id = f'rec-url-{viewer["id"]}'
         playlist_cards += (
             '<div class="login-card">'
             f'<strong>{_html_escape(viewer.get("name") or "Viewer")}</strong>'
@@ -677,7 +698,14 @@ async def admin_connections_get(request: web.Request) -> web.Response:
             f'<button type="button" onclick="navigator.clipboard.writeText(document.getElementById(\'{field_id}\').value);this.textContent=\'Copied\'">'
             'Copy full M3U URL</button>'
             f' <a href="/player?token={_html_escape(viewer["token"])}" target="_blank" rel="noopener">'
-            '<button type="button">Open Player</button></a></div>'
+            '<button type="button">Open Player</button></a>'
+            f'<input id="{rec_field_id}" readonly value="{_html_escape(rec_url)}" '
+            'style="width:100%;font:12px ui-monospace,monospace;margin:0.6rem 0 0;padding:.4rem .5rem">'
+            f'<button type="button" class="copy-rec" data-target="{rec_field_id}" '
+            'style="margin-top:.4rem">Copy record link</button>'
+            f' <a href="/rec/{_html_escape(viewer["token"])}" target="_blank" rel="noopener">'
+            '<button type="button">Open record page</button></a>'
+            '</div>'
         )
     playlist_box = (
         '<h2>Viewer M3U URLs</h2>' + playlist_cards
@@ -1538,9 +1566,24 @@ async def _test_channel(upstream: str, allowed_host: str, auth_header: str) -> d
 # ---- Viewers ----
 
 
+def _rec_link_cell(viewer: dict, public_url: str) -> str:
+    """Render a copyable mobile-friendly record link for one viewer."""
+    base = (public_url or "").rstrip("/") or "https://tv.berrie.uk"
+    url = f"{base}/rec/{viewer['token']}"
+    fid = f"rec-url-{viewer['id']}"
+    return (
+        f'<input id="{fid}" readonly value="{_html_escape(url)}" '
+        'style="width:100%;font:12px ui-monospace,monospace;padding:.3rem .4rem">'
+        f'<button type="button" class="copy-rec" data-target="{fid}" '
+        'style="margin-top:.3rem;font-size:11px;padding:.25rem .55rem">'
+        'Copy record link</button>'
+    )
+
+
 async def admin_viewers_get(request: web.Request) -> web.Response:
     rows = await request.app["viewers"].list_all()
     flash = _flash_consume(request.app)
+    public_url = (await request.app["settings_store"].get("public_url")) or "https://tv.berrie.uk"
     table = ""
     now = time.time()
     for r in rows:
@@ -1579,6 +1622,7 @@ async def admin_viewers_get(request: web.Request) -> web.Response:
             f"<td>{exp_str}{exp_pill}</td>"
             f"<td>{'disabled' if r['disabled'] else 'enabled'}</td>"
             f"<td>{last_str}</td>"
+            f'<td>{_rec_link_cell(r, public_url)}</td>'
             "<td>"
             f'<a href="/admin/viewers/{r["id"]}/edit">Edit</a> &middot; '
             f'<form class="inline" method="post" action="/admin/viewers/{r["id"]}/token" '
@@ -1594,7 +1638,7 @@ async def admin_viewers_get(request: web.Request) -> web.Response:
     body = flash + "<h2>Viewers</h2>" + (
         "<table><thead><tr>"
          "<th>ID</th><th>Name</th><th>Token</th><th>Short M3U</th><th>Max conn</th>"
-        "<th>Expires</th><th>Status</th><th>Last seen</th><th></th>"
+        "<th>Expires</th><th>Status</th><th>Last seen</th><th>Record link</th><th></th>"
         "</tr></thead><tbody>" + table + "</tbody></table>"
         if table else "<p class=\"muted\">No viewers yet.</p>"
     ) + await _viewer_form(request)
@@ -1709,9 +1753,29 @@ async def admin_viewers_edit_get(request: web.Request) -> web.Response:
     if not viewer:
         _flash_set(request.app, "err", "Viewer not found.")
         raise web.HTTPFound("/admin/viewers")
+    public_url = (await request.app["settings_store"].get("public_url")) or "https://tv.berrie.uk"
+    rec_url = f"{public_url.rstrip('/')}/rec/{viewer['token']}"
+    player_url = f"{public_url.rstrip('/')}/player?token={viewer['token']}"
     body = (
         f"<p><a href=\"/admin/viewers\">&laquo; Back</a></p>"
         f"<p><strong>Token:</strong> <code>{viewer['token']}</code></p>"
+        '<div class="login-card" style="margin:1rem 0">'
+        '<strong>Viewer links</strong>'
+        f'<label style="margin-top:.6rem">Record page (mobile-friendly)</label>'
+        f'<input id="rec-url-edit" readonly value="{_html_escape(rec_url)}" '
+        'style="width:100%;font:12px ui-monospace,monospace;padding:.4rem .5rem">'
+        '<button type="button" class="copy-rec" data-target="rec-url-edit" '
+        'style="margin-top:.4rem">Copy record link</button>'
+        f' <a href="{_html_escape(rec_url)}" target="_blank" rel="noopener">'
+        '<button type="button">Open record page</button></a>'
+        f'<label style="margin-top:.6rem">Player</label>'
+        f'<input id="player-url-edit" readonly value="{_html_escape(player_url)}" '
+        'style="width:100%;font:12px ui-monospace,monospace;padding:.4rem .5rem">'
+        '<button type="button" class="copy-rec" data-target="player-url-edit" '
+        'style="margin-top:.4rem">Copy player link</button>'
+        f' <a href="{_html_escape(player_url)}" target="_blank" rel="noopener">'
+        '<button type="button">Open player</button></a>'
+        '</div>'
         + await _viewer_form(
             request, viewer,
             action=f"/admin/viewers/{vid}",
@@ -2047,6 +2111,14 @@ async def admin_settings_get(request: web.Request) -> web.Response:
         f'<div><label>Upstream read timeout (s)</label><input name="upstream_read_timeout" type="number" min="1" max="600" value="{_html_escape(settings.get("upstream_read_timeout", "30"))}"></div>'
         f'<div><label>Log retention (days)</label><input name="log_retention_days" type="number" min="1" max="3650" value="{_html_escape(settings.get("log_retention_days", "30"))}"></div>'
         "</div>"
+        '<div class="grid">'
+        '<div><label>Movies folder (server path; empty = disabled)</label>'
+        f'<input name="movie_dir" type="text" value="{_html_escape(settings.get("movie_dir", ""))}" placeholder="/mnt/data/torrents/complete"></div>'
+        f'<div><label>M3U live URLs</label><select name="m3u_original_urls">'
+        f'<option value="0" {"selected" if settings.get("m3u_original_urls", "0") != "1" else ""}>Via proxy (tv2.berrie.uk)</option>'
+        f'<option value="1" {"selected" if settings.get("m3u_original_urls", "0") == "1" else ""}>Original provider URLs</option>'
+        '</select></div>'
+        "</div>"
         '<p><button class="primary" type="submit">Save settings</button></p>'
         "</form>"
     )
@@ -2062,6 +2134,7 @@ async def admin_settings_post(request: web.Request) -> web.Response:
         "public_url", "default_max_connections", "default_expires_days",
         "session_timeout_seconds", "upstream_connect_timeout",
         "upstream_read_timeout", "log_retention_days",
+        "movie_dir", "m3u_original_urls",
     ]
     updates = {k: str(data.get(k) or "").strip() for k in keys}
     await request.app["settings_store"].set_many(updates)
