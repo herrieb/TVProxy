@@ -383,6 +383,8 @@ def apply(db: sqlite3.Connection, plans: list[Plan], now: float | None = None,
                 if not dry_run:
                     db.execute("UPDATE recordings SET start_at=?, end_at=?, channel_id=?, updated_at=? "
                                "WHERE id=?", (pl.start_at, pl.end_at, pl.program.channel_id, now, rec["id"]))
+                    db.execute("UPDATE autorecord_log SET channel_id=? WHERE id=?",
+                               (pl.program.channel_id, log["id"]))
                     db.execute("UPDATE autorecord_log SET first_air_at=?, program_id=? WHERE id=?",
                                (pl.program.start_at, pl.program.id, log["id"]))
             for b in busy:
@@ -493,7 +495,7 @@ def main(argv=None) -> int:
                               c.display_name, l.first_air_at
                          FROM autorecord_log l JOIN autorecord_rules r ON r.id = l.rule_id
                          LEFT JOIN recordings rec ON rec.id = l.recording_id
-                         LEFT JOIN channels c ON c.id = l.channel_id
+                         LEFT JOIN channels c ON c.id = COALESCE(rec.channel_id, l.channel_id)
                         WHERE COALESCE(rec.end_at, l.first_air_at + 4*3600) > ?
                         ORDER BY COALESCE(rec.start_at, l.first_air_at)""", (time.time(),)):
                 when = row["start_at"] or row["first_air_at"]
