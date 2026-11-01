@@ -1,0 +1,17 @@
+[Unit]
+Description=TVProxy automatic recordings (F1 calendar, team fixtures, TV guide)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=tvproxy
+Group=tvproxy
+WorkingDirectory=/opt/tv-proxy
+Environment=TVPROXY_DB_PATH=/var/lib/tv-proxy/mappings.db
+ExecStart=/opt/tv-proxy/venv/bin/python -m app.autorecord run
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/tv-proxy

@@ -1,0 +1,32 @@
+# /etc/systemd/system/tv-proxy-media.service
+[Unit]
+Description=TVProxy LAN media playlist (recordings + videos for the TV)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=tvproxy
+Group=tvproxy
+WorkingDirectory=/opt/tv-proxy
+EnvironmentFile=/etc/tv-proxy-media.env
+ExecStart=/opt/tv-proxy/venv/bin/python -m app.media
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectHome=true
+ProtectSystem=strict
+# Read-write only because SQLite in WAL mode needs the -shm file even for
+# read-only connections; the code opens the DB with mode=ro.
+ReadWritePaths=/var/lib/tv-proxy
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+MemoryDenyWriteExecute=true
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target

@@ -33,7 +33,8 @@ TVGIDS_IDS = {
     "espn 1": "espn", "espn": "espn", "espn 2": "espn2",
     "espn 3": "espn3", "espn 4": "espn4", "eurosport 1": "eurosport1",
     "eurosport 2": "eurosport2", "ziggo sport": "ziggosport",
-    "ziggo sport 2": "ziggosport2",
+    "ziggo sport 2": "ziggosport2", "ziggo sport 3": "ziggosport3", "ziggo sport 4": "ziggosport4",
+    "ziggo sport 5": "ziggosport5", "ziggo sport 6": "ziggosport6",
     "ziggo sport 1": "ziggosport",
     "viaplay tv": "viaplaytv", "viaplay tv 2": "viaplaytvplus",
 }
@@ -83,6 +84,15 @@ def parse_tvgids(content: str, day: datetime) -> list[dict]:
         if not title_match:
             continue
         start = _parse_time(day, start_text)
+        if not programs and index + 1 < len(matches):
+            # tvgids.nl day pages open with the programme that is still running at
+            # midnight; it started the evening before. Without this, the next
+            # (earlier-looking) time triggered the rollover below and shifted the
+            # whole day one day late.
+            nxt0 = _clean(matches[index + 1].group(1))
+            if re.fullmatch(r"\d{1,2}:\d{2}", nxt0) and int(start_text.split(":")[0]) >= 12 \
+                    and _parse_time(day, nxt0) < start:
+                start -= 86400
         if programs and start <= programs[-1]["start"]:
             start += 86400
         next_start = None
