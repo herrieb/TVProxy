@@ -305,3 +305,20 @@ def test_skipped_programme_is_never_scheduled(db):
     db.commit()
     assert ar.run(db_path=path, now=NOW, fetch=lambda url: doc) == []
     assert recordings(db) == []
+
+
+
+def test_changing_the_rule_channel_moves_scheduled_recordings(db):
+    db.execute("INSERT INTO channels (id, display_name) VALUES (3546, 'NL: Viaplay F1 FHD ( Ziggo )')")
+    add_kind_rule(db, "Formule 1 live", "f1", {"channel_id": 3546}, 10, 30, 10)
+    path = db.execute("PRAGMA database_list").fetchone()[2]
+    race = NOW + 30 * H
+    doc = jolpica([f1_race(20, "Brazilian Grand Prix", race, race - 23 * H)])
+    ar.run(db_path=path, now=NOW, fetch=lambda url: doc)
+    assert {r["channel_id"] for r in recordings(db)} == {3546}
+    db.execute("UPDATE autorecord_rules SET params=? WHERE id=1", (_json.dumps({"channel_id": 3548}),))
+    db.commit()
+    report = ar.run(db_path=path, now=NOW + 60, fetch=lambda url: doc)
+    assert {r["channel_id"] for r in recordings(db)} == {3548}
+    assert len(recordings(db)) == 2
+    assert all("on NL: Viaplay +TV" in line for line in report if line.startswith("moved"))

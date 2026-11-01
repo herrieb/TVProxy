@@ -375,12 +375,14 @@ def apply(db: sqlite3.Connection, plans: list[Plan], now: float | None = None,
         if log and log["recording_id"]:
             rec = db.execute("SELECT * FROM recordings WHERE id=?", (log["recording_id"],)).fetchone()
         if rec is not None:
-            if rec["status"] == "scheduled" and (abs(rec["start_at"] - pl.start_at) > 1
-                                                 or abs(rec["end_at"] - pl.end_at) > 1):
-                report.append(f"moved     {pl.title} -> {fmt}")
+            moved = abs(rec["start_at"] - pl.start_at) > 1 or abs(rec["end_at"] - pl.end_at) > 1
+            rechannel = rec["channel_id"] != pl.program.channel_id
+            if rec["status"] == "scheduled" and (moved or rechannel):
+                report.append(f"moved     {pl.title} -> {fmt}"
+                              + (f" on {pl.program.channel_name}" if rechannel else ""))
                 if not dry_run:
-                    db.execute("UPDATE recordings SET start_at=?, end_at=?, updated_at=? WHERE id=?",
-                               (pl.start_at, pl.end_at, now, rec["id"]))
+                    db.execute("UPDATE recordings SET start_at=?, end_at=?, channel_id=?, updated_at=? "
+                               "WHERE id=?", (pl.start_at, pl.end_at, pl.program.channel_id, now, rec["id"]))
                     db.execute("UPDATE autorecord_log SET first_air_at=?, program_id=? WHERE id=?",
                                (pl.program.start_at, pl.program.id, log["id"]))
             for b in busy:
