@@ -20,7 +20,8 @@ before until M minutes after". Every run (systemd timer, every 30 minutes):
 4. schedule it as a normal recording for the rule's viewer; if the guide time
    moves before it starts, the scheduled recording moves with it;
 5. overlapping recordings: the provider allows one stream at a time, so the rule
-   with the higher priority wins and the other is logged as a conflict.
+   with the higher priority is recorded in full and the other is trimmed around
+   it (possibly into two parts) or cancelled if nothing useful is left.
 
 Usage:
     python -m app.autorecord run [--dry-run]
@@ -349,81 +350,171 @@ def plan(db: sqlite3.Connection, now: float | None = None,
     return plans, sorted(set(notes))
 
 
+SLOT_GAP = 60          # seconds between two recordings so the provider frees the stream
+MIN_PART = 10 * 60    # leftover pieces shorter than this are not worth recording
+
+
 def _overlaps(a_start, a_end, b_start, b_end) -> bool:
     return a_start < b_end and b_start < a_end
 
 
+def free_parts(start: float, end: float, busy: list[dict]) -> list[tuple[float, float]]:
+    """The pieces of [start, end) not covered by busy slots (with SLOT_GAP around
+    them); pieces shorter than MIN_PART are dropped."""
+    parts = [(start, end)]
+    for b in busy:
+        b0, b1 = b["start_at"] - SLOT_GAP, b["end_at"] + SLOT_GAP
+        nxt = []
+        for s0, s1 in parts:
+            if not _overlaps(s0, s1, b0, b1):
+                nxt.append((s0, s1))
+                continue
+            if s0 < b0:
+                nxt.append((s0, b0))
+            if b1 < s1:
+                nxt.append((b1, s1))
+        parts = nxt
+    return [(a, b) for a, b in sorted(parts) if b - a >= MIN_PART]
+
+
+def _short(title: str) -> str:
+    """'UEFA Champions League: PSV - Club Brugge' -> 'PSV - Club Brugge'."""
+    t = re.sub(r"\s*\[[^\]]*\]\s*$", "", title)
+    return (t.split(": ", 1)[1] if ": " in t else t)[:40]
+
+
+def part_title(title: str, i: int, n: int, p0: float, p1: float, trimmed: bool, blocker: str) -> str:
+    """Recording title, with a visible label when it is not recorded in full."""
+    hhmm = lambda t: time.strftime("%H:%M", time.localtime(t))  # noqa: E731
+    if n > 1:
+        return f"{title} [deel {i}/{n}: {hhmm(p0)}-{hhmm(p1)}, onderbroken voor {blocker}]"
+    if trimmed:
+        return f"{title} [gedeeltelijk {hhmm(p0)}-{hhmm(p1)}, voorrang {blocker}]"
+    return title
+
+
 def apply(db: sqlite3.Connection, plans: list[Plan], now: float | None = None,
           dry_run: bool = False) -> list[str]:
-    """Create/update recordings for the plans; return a human-readable report."""
+    """Turn plans into recordings, highest priority (lowest number) first.
+
+    Only one stream at a time: a lower-priority programme is trimmed around the
+    slots already taken (it can become two parts), or cancelled if nothing is
+    left. This is recomputed every run, so a higher-priority programme that
+    appears later in the guide still pushes an already scheduled one aside.
+    Recordings that are already running are never touched.
+    """
     now = time.time() if now is None else now
     report: list[str] = []
-    # existing recordings that occupy the provider slot
-    busy = [dict(r) for r in db.execute(
+    auto_ids = {r[0] for r in db.execute(
+        "SELECT recording_id FROM autorecord_log WHERE recording_id IS NOT NULL")}
+    active = [dict(r) for r in db.execute(
         "SELECT id, title, start_at, end_at, status FROM recordings "
         "WHERE status IN ('scheduled','recording') AND end_at > ?", (now,))]
-    # higher priority first, so it claims the slot before lower ones
-    for pl in sorted(plans, key=lambda x: (x.rule["priority"], x.start_at)):
-        fmt = time.strftime("%a %d-%m %H:%M", time.localtime(pl.start_at))
-        log = db.execute(
+    # fixed slots: manual recordings and anything already running
+    busy = [r for r in active if r["id"] not in auto_ids or r["status"] == "recording"]
+
+    def find_log(rule_id, key, first_air):
+        return db.execute(
             "SELECT * FROM autorecord_log WHERE rule_id=? AND match_key=? "
             "AND ABS(first_air_at - ?) <= ? ORDER BY ABS(first_air_at - ?) LIMIT 1",
-            (pl.rule["id"], pl.key, pl.program.start_at, MOVE_TOLERANCE, pl.program.start_at)).fetchone()
+            (rule_id, key, first_air, MOVE_TOLERANCE, first_air)).fetchone()
+
+    def recording(log):
+        if log and log["recording_id"]:
+            return db.execute("SELECT * FROM recordings WHERE id=?", (log["recording_id"],)).fetchone()
+        return None
+
+    for pl in sorted(plans, key=lambda x: (x.rule["priority"], x.start_at)):
+        fmt = time.strftime("%a %d-%m %H:%M", time.localtime(pl.start_at))
+        log = find_log(pl.rule["id"], pl.key, pl.program.start_at)
         if log and log["state"] == "skipped":      # user said: not this one
             continue
-        rec = None
-        if log and log["recording_id"]:
-            rec = db.execute("SELECT * FROM recordings WHERE id=?", (log["recording_id"],)).fetchone()
-        if rec is not None:
-            moved = abs(rec["start_at"] - pl.start_at) > 1 or abs(rec["end_at"] - pl.end_at) > 1
-            rechannel = rec["channel_id"] != pl.program.channel_id
-            if rec["status"] == "scheduled" and (moved or rechannel):
-                report.append(f"moved     {pl.title} -> {fmt}"
-                              + (f" on {pl.program.channel_name}" if rechannel else ""))
+        rec = recording(log)
+        if rec is not None and rec["status"] == "recording":
+            continue                                # running: leave it alone (already busy)
+
+        parts = free_parts(pl.start_at, pl.end_at, busy)
+        if not parts:
+            clash = next((b for b in busy if _overlaps(pl.start_at, pl.end_at, b["start_at"], b["end_at"])), None)
+            note = f"overlaps with '{clash['title']}'" if clash else "no free slot"
+            if rec is not None and rec["status"] == "scheduled":
+                report.append(f"cancelled {pl.title} {fmt}: {note}")
                 if not dry_run:
-                    db.execute("UPDATE recordings SET start_at=?, end_at=?, channel_id=?, updated_at=? "
-                               "WHERE id=?", (pl.start_at, pl.end_at, pl.program.channel_id, now, rec["id"]))
-                    db.execute("UPDATE autorecord_log SET channel_id=? WHERE id=?",
-                               (pl.program.channel_id, log["id"]))
-                    db.execute("UPDATE autorecord_log SET first_air_at=?, program_id=? WHERE id=?",
-                               (pl.program.start_at, pl.program.id, log["id"]))
-            for b in busy:
-                if b["id"] == rec["id"]:
-                    b["start_at"], b["end_at"] = pl.start_at, pl.end_at
-            continue
-        clash = next((b for b in busy if _overlaps(pl.start_at, pl.end_at, b["start_at"], b["end_at"])), None)
-        if clash:
-            note = f"overlaps with '{clash['title']}'"
-            if not log:
+                    db.execute("DELETE FROM recordings WHERE id=?", (rec["id"],))
+            elif not log or log["state"] != "conflict":
                 report.append(f"CONFLICT  {pl.title} {fmt} ({pl.rule['name']}): {note}")
-                if not dry_run:
+            if not dry_run:
+                if log:
+                    db.execute("UPDATE autorecord_log SET state='conflict', recording_id=NULL, note=? "
+                               "WHERE id=?", (note, log["id"]))
+                else:
                     db.execute("INSERT INTO autorecord_log (rule_id, match_key, first_air_at, program_id, "
                                "channel_id, state, note, created_at) VALUES (?,?,?,?,?,?,?,?)",
                                (pl.rule["id"], pl.key, pl.program.start_at, pl.program.id,
                                 pl.program.channel_id, "conflict", note, now))
-            continue
-        report.append(f"scheduled {pl.title} {fmt} on {pl.program.channel_name} ({pl.rule['name']})"
-                      + (f"  [key {pl.key}]" if dry_run else ""))
-        if dry_run:
-            busy.append({"id": None, "title": pl.title, "start_at": pl.start_at, "end_at": pl.end_at})
-            continue
-        cur = db.execute(
-            """INSERT INTO recordings (viewer_id, channel_id, title, start_at, end_at, timezone,
-                                       status, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, 'Europe/Amsterdam', 'scheduled', ?, ?)""",
-            (pl.rule["viewer_id"], pl.program.channel_id, pl.title[:200],
-             pl.start_at, pl.end_at, now, now))
-        rid = cur.lastrowid
-        busy.append({"id": rid, "title": pl.title, "start_at": pl.start_at, "end_at": pl.end_at})
-        if log:
-            db.execute("UPDATE autorecord_log SET recording_id=?, state='scheduled', note='', "
-                       "program_id=?, channel_id=? WHERE id=?",
-                       (rid, pl.program.id, pl.program.channel_id, log["id"]))
-        else:
-            db.execute("INSERT INTO autorecord_log (rule_id, match_key, first_air_at, program_id, "
-                       "channel_id, recording_id, state, created_at) VALUES (?,?,?,?,?,?,?,?)",
-                       (pl.rule["id"], pl.key, pl.program.start_at, pl.program.id,
-                        pl.program.channel_id, rid, "scheduled", now))
+            parts = []
+
+        n = len(parts)
+        cover = [b for b in busy if _overlaps(pl.start_at, pl.end_at, b["start_at"], b["end_at"])]
+        blocker = _short(max(cover, key=lambda b: min(b["end_at"], pl.end_at) - max(b["start_at"], pl.start_at))
+                         ["title"]) if cover else ""
+        for i, (p0, p1) in enumerate(parts, 1):
+            key = pl.key if i == 1 else f"{pl.key}#{i}"
+            trimmed = p0 > pl.start_at + 1 or p1 < pl.end_at - 1
+            title = part_title(pl.title, i, n, p0, p1, trimmed, blocker)
+            when = (time.strftime("%a %d-%m %H:%M", time.localtime(p0)) + "-"
+                    + time.strftime("%H:%M", time.localtime(p1)))
+            plog = log if i == 1 else find_log(pl.rule["id"], key, pl.program.start_at)
+            prec = rec if i == 1 else recording(plog)
+            busy.append({"id": prec["id"] if prec else None, "title": title, "start_at": p0, "end_at": p1})
+            if prec is not None and prec["status"] == "scheduled":
+                changed = (abs(prec["start_at"] - p0) > 1 or abs(prec["end_at"] - p1) > 1
+                           or prec["channel_id"] != pl.program.channel_id or prec["title"] != title[:200])
+                if changed:
+                    report.append(f"moved     {title} -> {when} on {pl.program.channel_name}"
+                                  + (" (trimmed around a higher-priority recording)" if trimmed else ""))
+                    if not dry_run:
+                        db.execute("UPDATE recordings SET start_at=?, end_at=?, channel_id=?, title=?, "
+                                   "updated_at=? WHERE id=?",
+                                   (p0, p1, pl.program.channel_id, title[:200], now, prec["id"]))
+                        db.execute("UPDATE autorecord_log SET first_air_at=?, program_id=?, channel_id=?, "
+                                   "state='scheduled', note=? WHERE id=?",
+                                   (pl.program.start_at, pl.program.id, pl.program.channel_id,
+                                    "trimmed" if trimmed else "", plog["id"]))
+                continue
+            report.append(f"scheduled {title} {when} on {pl.program.channel_name} ({pl.rule['name']})"
+                          + (" (trimmed around a higher-priority recording)" if trimmed else "")
+                          + (f"  [key {pl.key}]" if dry_run else ""))
+            if dry_run:
+                continue
+            rid = db.execute(
+                """INSERT INTO recordings (viewer_id, channel_id, title, start_at, end_at, timezone,
+                                           status, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, 'Europe/Amsterdam', 'scheduled', ?, ?)""",
+                (pl.rule["viewer_id"], pl.program.channel_id, title[:200], p0, p1, now, now)).lastrowid
+            busy[-1]["id"] = rid
+            if plog:
+                db.execute("UPDATE autorecord_log SET recording_id=?, state='scheduled', note=?, "
+                           "program_id=?, channel_id=?, first_air_at=? WHERE id=?",
+                           (rid, "trimmed" if trimmed else "", pl.program.id, pl.program.channel_id,
+                            pl.program.start_at, plog["id"]))
+            else:
+                db.execute("INSERT INTO autorecord_log (rule_id, match_key, first_air_at, program_id, "
+                           "channel_id, recording_id, state, note, created_at) VALUES (?,?,?,?,?,?,?,?,?)",
+                           (pl.rule["id"], key, pl.program.start_at, pl.program.id,
+                            pl.program.channel_id, rid, "scheduled", "trimmed" if trimmed else "", now))
+        # parts that are no longer needed (e.g. the overlap went away)
+        for extra in db.execute("SELECT * FROM autorecord_log WHERE rule_id=? AND match_key LIKE ? "
+                                "AND recording_id IS NOT NULL", (pl.rule["id"], pl.key + "#%")).fetchall():
+            idx = int(extra["match_key"].rsplit("#", 1)[1])
+            if idx > n:
+                xrec = recording(extra)
+                if xrec is not None and xrec["status"] == "scheduled":
+                    report.append(f"cancelled {xrec['title']}: no longer needed")
+                    if not dry_run:
+                        db.execute("DELETE FROM recordings WHERE id=?", (xrec["id"],))
+                        db.execute("UPDATE autorecord_log SET recording_id=NULL, state='conflict', "
+                                   "note='merged' WHERE id=?", (extra["id"],))
     if not dry_run:
         db.commit()
     return report

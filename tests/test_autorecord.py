@@ -1,6 +1,7 @@
 """Tests for app.autorecord, using real guide titles seen on 2026-11-01."""
 
 import sqlite3
+import time
 
 import pytest
 
@@ -120,18 +121,107 @@ def test_formula1_race_and_qualifying_not_magazines(db):
     assert race["end_at"] == t + 27.75 * H + 30 * 60   # +30 min for F1
 
 
-def test_conflict_higher_priority_wins(db):
-    add_rule(db, PSV); add_rule(db, F1)
+def test_overlap_lower_priority_is_trimmed_not_dropped(db):
+    add_rule(db, PSV); add_rule(db, F1)                 # in this fixture F1 has priority 10
     path = db.execute("PRAGMA database_list").fetchone()[2]
     t = NOW + 5 * H
     prog(db, 3578, t, t + 2 * H, "Eredivisie: PSV - Ajax")
     prog(db, 3548, t + 1 * H, t + 3 * H, "Formule 1: GP van Las Vegas Race")
+    ar.run(db_path=path, now=NOW)
+    recs = recordings(db)
+    f1 = next(r for r in recs if r["title"].startswith("Formule 1"))
+    psv = next(r for r in recs if "PSV" in r["title"])
+    assert (f1["start_at"], f1["end_at"]) == (t + H - 600, t + 3 * H + 1800)      # in full
+    assert psv["start_at"] == t - 600 and psv["end_at"] == f1["start_at"] - 60   # trimmed before F1
+    assert not _overlaps(psv, f1)
+
+
+def _overlaps(a, b):
+    return a["start_at"] < b["end_at"] and b["start_at"] < a["end_at"]
+
+
+PSV_LEAD = PSV | {"priority": 10}
+F1_SECOND = F1 | {"priority": 20}
+
+
+def test_psv_in_full_then_f1_after_the_match(db):
+    """The user's rule: PSV always leads; F1 starts after the PSV recording."""
+    add_rule(db, PSV_LEAD); add_rule(db, F1_SECOND)
+    path = db.execute("PRAGMA database_list").fetchone()[2]
+    t = NOW + 5 * H                                         # PSV 16:45-18:40, F1 race 18:00-20:00
+    prog(db, 3578, t, t + 1.9 * H, "Eredivisie: SC Cambuur - PSV")
+    prog(db, 3548, t + 1.25 * H, t + 3.25 * H, "Formule 1: GP van Brazilië Race")
+    ar.run(db_path=path, now=NOW)
+    psv, f1 = recordings(db)
+    assert (psv["start_at"], psv["end_at"]) == (t - 600, t + 1.9 * H + 1200)      # full, -10/+20
+    assert f1["start_at"] == psv["end_at"] + 60                                    # right after PSV
+    assert f1["end_at"] == t + 3.25 * H + 1800                                     # F1 end +30 kept
+    hhmm = lambda x: time.strftime("%H:%M", time.localtime(x))
+    assert f1["title"] == (f"Formule 1: GP van Brazilië Race [gedeeltelijk {hhmm(f1['start_at'])}-"
+                           f"{hhmm(f1['end_at'])}, voorrang SC Cambuur - PSV]")
+    assert psv["title"] == "Eredivisie: SC Cambuur - PSV"                          # full: no label
+
+
+def test_f1_split_around_a_psv_match_in_the_middle(db):
+    add_rule(db, PSV_LEAD); add_rule(db, F1_SECOND)
+    path = db.execute("PRAGMA database_list").fetchone()[2]
+    t = NOW + 5 * H
+    prog(db, 3548, t, t + 4 * H, "Formule 1: GP van Japan Race")                   # long F1 window
+    prog(db, 3578, t + 1 * H, t + 2.5 * H, "KNVB Beker: PSV - Vitesse")
+    ar.run(db_path=path, now=NOW)
+    recs = recordings(db)
+    titles = [r["title"] for r in recs]
+    assert titles[1] == "KNVB Beker: PSV - Vitesse"
+    assert titles[0].startswith("Formule 1: GP van Japan Race [deel 1/2: ")
+    assert titles[0].endswith(", onderbroken voor PSV - Vitesse]")
+    assert titles[2].startswith("Formule 1: GP van Japan Race [deel 2/2: ")
+    for a, b in zip(recs, recs[1:]):
+        assert a["end_at"] + 60 <= b["start_at"]                                   # never two at once
+
+
+def test_f1_fully_inside_psv_is_a_conflict(db):
+    add_rule(db, PSV_LEAD); add_rule(db, F1_SECOND | {"before_min": 0, "after_min": 0})
+    path = db.execute("PRAGMA database_list").fetchone()[2]
+    t = NOW + 5 * H
+    prog(db, 3578, t, t + 3 * H, "Eredivisie: PSV - Feyenoord")
+    prog(db, 3548, t + H, t + 1.5 * H, "Formule 1: GP van Monaco Kwalificatie")
     report = ar.run(db_path=path, now=NOW)
-    titles = [r["title"] for r in recordings(db)]
-    assert titles == ["Formule 1: GP van Las Vegas Race"]
-    assert any(line.startswith("CONFLICT  Eredivisie: PSV - Ajax") for line in report)
-    state = db.execute("SELECT state FROM autorecord_log WHERE match_key LIKE '%ajax%'").fetchone()[0]
-    assert state == "conflict"
+    assert [r["title"] for r in recordings(db)] == ["Eredivisie: PSV - Feyenoord"]
+    assert any(line.startswith("CONFLICT  Formule 1: GP van Monaco Kwalificatie") for line in report)
+
+
+def test_psv_appearing_later_trims_already_scheduled_f1(db):
+    add_rule(db, PSV_LEAD); add_rule(db, F1_SECOND)
+    path = db.execute("PRAGMA database_list").fetchone()[2]
+    t = NOW + 50 * H
+    prog(db, 3548, t + 1.25 * H, t + 3.25 * H, "Formule 1: GP van Brazilië Race")
+    ar.run(db_path=path, now=NOW)
+    f1 = recordings(db)[0]
+    assert f1["start_at"] == t + 1.25 * H - 600                                    # nothing in the way yet
+    prog(db, 3578, t, t + 1.9 * H, "Eredivisie: SC Cambuur - PSV")                 # guide fills in later
+    report = ar.run(db_path=path, now=NOW + 3 * H)
+    psv, f1 = recordings(db)
+    assert psv["title"] == "Eredivisie: SC Cambuur - PSV"
+    assert f1["start_at"] == psv["end_at"] + 60
+    assert any(line.startswith("moved     Formule 1") and "trimmed" in line for line in report)
+    assert len(recordings(db)) == 2                                                # moved, not duplicated
+
+
+def test_split_parts_merge_back_when_overlap_disappears(db):
+    add_rule(db, PSV_LEAD); add_rule(db, F1_SECOND)
+    path = db.execute("PRAGMA database_list").fetchone()[2]
+    t = NOW + 5 * H
+    prog(db, 3548, t, t + 4 * H, "Formule 1: GP van Japan Race")
+    prog(db, 3578, t + 1 * H, t + 2.5 * H, "KNVB Beker: PSV - Vitesse")
+    ar.run(db_path=path, now=NOW)
+    assert len(recordings(db)) == 3
+    db.execute("DELETE FROM epg_programs WHERE title LIKE '%Vitesse%'")             # match moved away
+    db.commit()
+    report = ar.run(db_path=path, now=NOW + 60)
+    titles = [r["title"] for r in recordings(db) if "Japan" in r["title"]]
+    assert titles == ["Formule 1: GP van Japan Race"]                              # one piece again
+    assert any(line.startswith("cancelled") and "deel 2/2" in line for line in report)
+    assert "[" not in titles[0]                                                    # label gone
 
 
 def test_run_is_idempotent_and_follows_time_changes(db):
@@ -322,3 +412,10 @@ def test_changing_the_rule_channel_moves_scheduled_recordings(db):
     assert {r["channel_id"] for r in recordings(db)} == {3548}
     assert len(recordings(db)) == 2
     assert all("on NL: Viaplay +TV" in line for line in report if line.startswith("moved"))
+
+
+
+def test_part_title_labels():
+    assert ar.part_title("X", 1, 1, 0, 0, False, "") == "X"
+    assert ar._short("UEFA Champions League: PSV - Club Brugge") == "PSV - Club Brugge"
+    assert ar._short("Formule 1: GP Race [gedeeltelijk 19:01-20:30, voorrang PSV - Ajax]") == "GP Race"
