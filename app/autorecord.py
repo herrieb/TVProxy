@@ -50,6 +50,7 @@ from datetime import datetime, timezone
 
 DB_PATH = os.environ.get("TVPROXY_DB_PATH", "/var/lib/tv-proxy/mappings.db")
 HORIZON = 8 * 24 * 3600          # look this far ahead in the guide
+F1_HORIZON = 400 * 24 * 3600     # the F1 calendar is fixed: plan the rest of the season
 RERUN_WINDOW = 7 * 24 * 3600     # same programme again within this window = rerun
 MOVE_TOLERANCE = 6 * 3600        # a guide entry moved by up to this much is the same broadcast
 
@@ -286,9 +287,10 @@ def plan_f1(db, rule, params, now, notes, fetch) -> list[Plan]:
     row = db.execute("SELECT display_name FROM channels WHERE id=?", (channel_id,)).fetchone()
     name = row[0] if row else str(channel_id)
     plans = []
+    horizon = float(params.get("horizon_days", F1_HORIZON / 86400)) * 86400
     for s in f1_sessions(fetch(params.get("url", F1_URL))):
         end = s["start"] + s["minutes"] * 60
-        if end <= now or s["start"] > now + HORIZON:
+        if end <= now or s["start"] > now + horizon:
             continue
         prog = Program(None, channel_id, name, s["start"], end, s["title"])
         plans.append(Plan(rule, prog, s["key"], s["start"] - rule["before_min"] * 60,

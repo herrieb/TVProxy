@@ -419,3 +419,16 @@ def test_part_title_labels():
     assert ar.part_title("X", 1, 1, 0, 0, False, "") == "X"
     assert ar._short("UEFA Champions League: PSV - Club Brugge") == "PSV - Club Brugge"
     assert ar._short("Formule 1: GP Race [gedeeltelijk 19:01-20:30, voorrang PSV - Ajax]") == "GP Race"
+
+
+
+def test_f1_plans_the_rest_of_the_season(db):
+    add_kind_rule(db, "Formule 1 live", "f1", {"channel_id": 3548}, 10, 30, 20)
+    path = db.execute("PRAGMA database_list").fetchone()[2]
+    days = 24 * H
+    doc = jolpica([f1_race(21, "Brazilian Grand Prix", NOW + 7 * days, NOW + 6 * days),
+                   f1_race(22, "Las Vegas Grand Prix", NOW + 21 * days, NOW + 20 * days),
+                   f1_race(24, "Abu Dhabi Grand Prix", NOW + 35 * days, NOW + 34 * days)])
+    ar.run(db_path=path, now=NOW, fetch=lambda url: doc)
+    assert len(recordings(db)) == 6                     # 3 weekends x (qualifying + race)
+    assert recordings(db)[-1]["title"] == "Formule 1: Abu Dhabi Grand Prix – Race"
