@@ -507,7 +507,10 @@ class ChunkBuffer:
 HTTP_KEY = web.AppKey("http", aiohttp.ClientSession)
 PRIORITY_CHECK_SECONDS = 5.0
 BUSY_CLIP_SECONDS = 600      # length of recording-in-progress.ts (make-busy-clip.sh)
-BUSY_PACE = 1.1              # send the clip 10% faster than it plays
+# Exactly playback speed: anything faster piles up in TCP/Cloudflare/TV buffers,
+# and with this low-bitrate still clip a few MB is minutes of video the TV would
+# keep showing after the recording ended. BUSY_PREBUFFER gives the head start.
+BUSY_PACE = 1.0
 BUSY_PREBUFFER = 4.0         # seconds the TV may have buffered ahead
 
 
@@ -661,7 +664,7 @@ def create_app(config: Config) -> web.Application:
                          missing_text: str = "Stream not available") -> web.StreamResponse:
         """Play a notice clip for as long as `still_blocked()` is truthy.
 
-        The clip is sent at (slightly faster than) its own playback speed and the
+        The clip is sent at its own playback speed (plus a few seconds head start) and the
         stream ends within ~5 s of the reason going away, so the TV only has a few
         seconds buffered, sees the end of the stream and reconnects to the channel
         by itself. If the reason outlasts the clip, the reconnect gets it again.
@@ -679,6 +682,16 @@ def create_app(config: Config) -> web.Application:
         try:
             with open(clip, "rb") as f:
                 while True:
+                    # Check on a timer, whatever the TV is doing: once its buffer is
+                    # full the TV reads at playback speed, slower than we pace, so
+                    # we may never "catch up" (that is how the first version missed
+                    # the end of a recording).
+                    if time.monotonic() >= next_check:
+                        next_check = time.monotonic() + PRIORITY_CHECK_SECONDS
+                        if not await still_blocked():
+                            logger.info("%s: reason gone, ending clip so the TV reconnects",
+                                        clip.name)
+                            break
                     # allow BUSY_PREBUFFER seconds ahead of real time, no more
                     allowed = int(rate * (time.monotonic() - start + BUSY_PREBUFFER))
                     if allowed > sent:
@@ -687,14 +700,8 @@ def create_app(config: Config) -> web.Application:
                             break                            # clip finished
                         await out.write(chunk)
                         sent += len(chunk)
-                        continue
-                    if time.monotonic() >= next_check:
-                        next_check = time.monotonic() + PRIORITY_CHECK_SECONDS
-                        if not await still_blocked():
-                            logger.info("%s: reason gone, ending clip so the TV reconnects",
-                                        clip.name)
-                            break
-                    await asyncio.sleep(0.5)
+                    else:
+                        await asyncio.sleep(0.5)
         except (ConnectionError, asyncio.CancelledError):
             pass
         return out

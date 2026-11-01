@@ -758,3 +758,61 @@ class TestRelayBuffer:
         await resp.content.readexactly(1000)
         assert _t.monotonic() - t0 < 0.3
         assert len(await resp.read()) == 9_000
+
+
+
+async def test_clip_ends_promptly_for_a_tv_reading_at_playback_speed(tmp_path):
+    """Regression (seen on the real TV, 2026-11-01): a TV reads the clip at playback
+    speed; it must start streaming right away and end within ~2 s after the
+    recording finished. Runs the real service in its own process and reads over a
+    socket like a TV does (aiohttp's in-process test server did not reproduce the
+    real timing)."""
+    import os, socket, subprocess, sys, time as _t
+    clip = tmp_path / "busy.ts"
+    clip.write_bytes(b"G" * 2_000_000)                       # 10 s clip -> 200 kB/s
+    flag = tmp_path / "force-busy"
+    flag.write_text(str(_t.time() + 600))
+    for d in ("rec", "vid"):
+        (tmp_path / d).mkdir(exist_ok=True)
+    db = _db(tmp_path)
+    s_ = socket.socket(); s_.bind(("127.0.0.1", 0)); port = s_.getsockname()[1]; s_.close()
+    env = {**os.environ, "MEDIA_TOKEN": "x", "MEDIA_HOST": "127.0.0.1", "MEDIA_PORT": str(port),
+           "MEDIA_SOURCES": f"recordings:R:{tmp_path/'rec'},videos:V:{tmp_path/'vid'}",
+           "MEDIA_DB": db, "MEDIA_BUSY_CLIP": str(clip), "MEDIA_FORCE_BUSY": str(flag)}
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    code = ("import app.media as m; m.BUSY_CLIP_SECONDS=10; m.BUSY_PREBUFFER=0.5; "
+            "m.PRIORITY_CHECK_SECONDS=0.2; m.main()")
+    proc = subprocess.Popen([sys.executable, "-c", code], cwd=root, env=env,
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        for _ in range(100):
+            try:
+                socket.create_connection(("127.0.0.1", port), 0.2).close(); break
+            except OSError:
+                await asyncio.sleep(0.1)
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        writer.write(b"GET /tv/ab12/npo-1.ts HTTP/1.1\r\nHost: x\r\n\r\n")
+        await writer.drain()
+        t0 = _t.monotonic()
+        got, first_at, finished, ended_at = 0, None, None, None
+        while _t.monotonic() - t0 < 6:
+            try:
+                chunk = await asyncio.wait_for(reader.read(20_000), 1.0)   # ~200 kB/s
+            except asyncio.TimeoutError:
+                continue
+            if not chunk or chunk.endswith(b"0\r\n\r\n"):
+                ended_at = _t.monotonic() - t0
+                break
+            got += len(chunk)
+            if first_at is None:
+                first_at = _t.monotonic() - t0
+            await asyncio.sleep(0.1)
+            if finished is None and _t.monotonic() - t0 > 1.5:
+                flag.write_text("0")                            # recording finished
+                finished = _t.monotonic() - t0
+        writer.close()
+    finally:
+        proc.terminate(); proc.wait(5)
+    assert first_at is not None and first_at < 1.0, "clip did not start streaming right away"
+    assert ended_at is not None, "clip kept streaming after the recording ended"
+    assert ended_at - finished < 2.0
