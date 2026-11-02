@@ -432,3 +432,34 @@ def test_f1_plans_the_rest_of_the_season(db):
     ar.run(db_path=path, now=NOW, fetch=lambda url: doc)
     assert len(recordings(db)) == 6                     # 3 weekends x (qualifying + race)
     assert recordings(db)[-1]["title"] == "Formule 1: Abu Dhabi Grand Prix – Race"
+
+
+
+SINT = dict(name="Sinterklaasjournaal", include_re=r"Sinterklaasjournaal", exclude_re="",
+            before_min=5, after_min=10, priority=15)
+
+
+def test_daily_show_records_every_new_episode_not_reruns(db):
+    db.execute("INSERT INTO channels (id, display_name) VALUES (3555, 'NL: NPO 3 FHD'), (3556, 'NL: NPO 3 HD'), (3560, 'NL: NPO Zapp Extra')")
+    add_kind_rule(db, SINT["name"], "epg", {"rerun_window_hours": 20, "channel_re": r"NPO 3\b"},
+                  5, 10, 15)
+    db.execute("UPDATE autorecord_rules SET include_re=? WHERE name=?", (SINT["include_re"], SINT["name"]))
+    db.commit()
+    path = db.execute("PRAGMA database_list").fetchone()[2]
+    day = 24 * H
+    first = NOW + 2 * H                                           # Mon 18:00
+    for d in range(4):                                            # Mon..Thu
+        t = first + d * day
+        for ch in (3555, 3556):                                   # same airing, two variants
+            prog(db, ch, t, t + 0.25 * H, "Het Sinterklaasjournaal")
+        prog(db, 3555, t + 13 * H, t + 13.25 * H, "Het Sinterklaasjournaal")   # next-morning rerun
+        prog(db, 3560, t + 1 * H, t + 1.25 * H, "Het Sinterklaasjournaal")     # other channel
+    ar.run(db_path=path, now=NOW)
+    recs = recordings(db)
+    assert len(recs) == 4                                         # one per day
+    assert {r["channel_id"] for r in recs} == {3555}              # FHD, NPO 3 only
+    assert [r["start_at"] for r in recs] == [first + d * day - 300 for d in range(4)]
+    assert all(r["end_at"] - r["start_at"] == 0.25 * H + 900 for r in recs)
+    again = ar.run(db_path=path, now=NOW + 60)                    # idempotent
+    assert not [line for line in again if line.startswith(("scheduled", "moved", "cancelled"))]
+    assert len(recordings(db)) == 4

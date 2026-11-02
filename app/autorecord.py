@@ -250,31 +250,46 @@ def _programs(db: sqlite3.Connection, now: float) -> list[Program]:
     return [Program(**dict(r)) for r in rows]
 
 
-def plan_epg(db, rule, programs, now, notes) -> list[Plan]:
-    hits = [p for p in programs if matches(rule, p.title)]
-    # first airing per programme (from guide history and our own log)
-    first: dict[str, float] = {}
-    for p in hits:
-        k = match_key(p.title)
-        first[k] = min(first.get(k, p.start_at), p.start_at)
+def plan_epg(db, rule, programs, now, notes, params=None) -> list[Plan]:
+    """Guide entries matching the rule, first airing only.
+
+    params: rerun_window_hours (default 7 days; e.g. 20 for a daily show with a
+    new episode every day under the same title) and channel_re (only channels
+    whose name matches, e.g. 'NPO 3').
+    """
+    params = params or {}
+    window = float(params.get("rerun_window_hours", RERUN_WINDOW / 3600)) * 3600
+    chan = params.get("channel_re")
+    hits = sorted((p for p in programs if matches(rule, p.title)
+                   and (not chan or re.search(chan, p.channel_name, re.I))),
+                  key=lambda p: p.start_at)
+
+    def in_guide(k, t):        # is this (possibly moved) airing still in the guide?
+        return any(match_key(q.title) == k and abs(q.start_at - t) <= MOVE_TOLERANCE for q in hits)
+
+    # first airings we recorded/planned before and that the guide no longer shows
+    gone: dict[str, list[float]] = {}
     for k, t in db.execute("SELECT match_key, first_air_at FROM autorecord_log WHERE rule_id=?",
                            (rule["id"],)):
-        if now - t >= RERUN_WINDOW:
-            continue
-        # if the guide still has this broadcast (possibly moved), the guide time wins
-        if any(match_key(p.title) == k and abs(p.start_at - t) <= MOVE_TOLERANCE for p in hits):
-            continue
-        first[k] = min(first.get(k, t), t)
+        if now - t < window + HORIZON and not in_guide(k, t):
+            gone.setdefault(k, []).append(t)
+
+    # walk airings in time order: an airing within `window` after the current
+    # episode's first airing is a rerun; otherwise it starts a new episode
+    episode: dict[str, float] = {}
     best: dict[tuple, Program] = {}
     for p in hits:
         k = match_key(p.title)
-        if p.start_at != first[k]:
-            if p.end_at > now and p.start_at - first[k] < RERUN_WINDOW:
+        prev = [t for t in gone.get(k, []) if 0 < p.start_at - t < window]
+        if k in episode and 0 < p.start_at - episode[k] < window or prev:
+            if p.end_at > now:
                 notes.append(f"rerun skipped: {clean_title(p.title)} {_local(p.start_at)}")
             continue
+        if k not in episode or p.start_at - episode[k] >= window:
+            episode[k] = p.start_at
         if p.end_at <= now:
             continue
-        slot = (k, p.start_at)
+        slot = (k, p.start_at)            # same airing on several channels: keep the best
         cur = best.get(slot)
         if cur is None or channel_rank(p.channel_name) < channel_rank(cur.channel_name):
             best[slot] = p
@@ -345,7 +360,7 @@ def plan(db: sqlite3.Connection, now: float | None = None,
             elif kind == "team":
                 plans += plan_team(db, rule, params, programs, now, notes, fetch)
             else:
-                plans += plan_epg(db, rule, programs, now, notes)
+                plans += plan_epg(db, rule, programs, now, notes, params)
         except Exception as exc:          # one broken source must not stop the others
             notes.append(f"rule '{rule['name']}' skipped this run: {type(exc).__name__}: {exc}")
     plans.sort(key=lambda x: (x.start_at, x.rule["priority"]))
@@ -552,6 +567,8 @@ def main(argv=None) -> int:
     a.add_argument("--exclude", default=""); a.add_argument("--before", type=int, default=10)
     a.add_argument("--after", type=int, default=20); a.add_argument("--priority", type=int, default=100)
     a.add_argument("--viewer", default="twan")
+    a.add_argument("--rerun-hours", type=float, help="new episode if more than this after the last one")
+    a.add_argument("--channel-re", help="only channels whose name matches, e.g. 'NPO 3'")
     f = sub.add_parser("add-f1", help="F1 sessions from the official calendar")
     f.add_argument("name"); f.add_argument("--channel", type=int, required=True)
     f.add_argument("--before", type=int, default=10); f.add_argument("--after", type=int, default=30)
@@ -623,10 +640,12 @@ def main(argv=None) -> int:
             db.commit(); print("rule added")
         elif args.cmd == "add":
             re.compile(args.include); re.compile(args.exclude or "x")
+            params = {k: v for k, v in (("rerun_window_hours", args.rerun_hours),
+                                        ("channel_re", args.channel_re)) if v}
             db.execute("INSERT INTO autorecord_rules (name, include_re, exclude_re, before_min, after_min, "
-                       "priority, viewer_id, created_at) VALUES (?,?,?,?,?,?,?,?)",
+                       "priority, viewer_id, created_at, kind, params) VALUES (?,?,?,?,?,?,?,?,'epg',?)",
                        (args.name, args.include, args.exclude, args.before, args.after,
-                        args.priority, _viewer_id(db, args.viewer), time.time()))
+                        args.priority, _viewer_id(db, args.viewer), time.time(), json.dumps(params)))
             db.commit(); print("rule added")
         else:
             if args.cmd == "delete":
