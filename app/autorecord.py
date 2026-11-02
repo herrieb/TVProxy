@@ -106,6 +106,7 @@ class Plan:
     start_at: float
     end_at: float
     title: str
+    fallback: "Plan | None" = None    # recorded instead/as well if this one gets cut
 
 
 # ---- text helpers ----------------------------------------------------------
@@ -192,14 +193,60 @@ def f1_sessions(data: dict) -> list[dict]:
     for race in table["Races"]:
         base = f"f1:{table.get('season', race.get('season', ''))}:{race['round']}"
         name = race["raceName"]
-        out.append({"key": f"{base}:race", "title": f"Formule 1: {name} – Race",
-                    "start": _ts(race["date"], race.get("time")), "minutes": F1_RACE_MINUTES})
+        place = f1_place_tokens(race)
+        out.append({"key": f"{base}:race", "title": f"Formule 1: {name} – Race", "session": "Race",
+                    "place": place, "start": _ts(race["date"], race.get("time")),
+                    "minutes": F1_RACE_MINUTES})
         for field, (label, minutes) in F1_SESSIONS.items():
             if field in race:
                 out.append({"key": f"{base}:{field.lower()}", "title": f"Formule 1: {name} – {label}",
+                            "session": field, "place": place,
                             "start": _ts(race[field]["date"], race[field].get("time")),
                             "minutes": minutes})
     return out
+
+
+# Dutch guide titles say "GP van Brazilië"; the calendar says "Brazilian Grand Prix".
+F1_COUNTRY_NL = {"brazil": "brazilie", "usa": "verenigde staten", "united states": "verenigde staten",
+                 "mexico": "mexico", "qatar": "qatar", "uae": "abu dhabi", "united arab emirates": "abu dhabi",
+                 "japan": "japan", "china": "china", "saudi arabia": "saoedi arabie", "bahrain": "bahrein",
+                 "australia": "australie", "italy": "italie", "monaco": "monaco", "spain": "spanje",
+                 "canada": "canada", "austria": "oostenrijk", "uk": "groot brittannie",
+                 "united kingdom": "groot brittannie", "hungary": "hongarije", "belgium": "belgie",
+                 "netherlands": "nederland", "azerbaijan": "azerbeidzjan", "singapore": "singapore"}
+F1_SESSION_RE = {"Race": (r"\bRace\b", r"\bSprint"),
+                 "Qualifying": (r"Kwalificatie", r"\bSprint"),
+                 "Sprint": (r"\bSprint\b", r"kwalificatie|shootout"),
+                 "SprintQualifying": (r"Sprint.?(kwalificatie|shootout)", None),
+                 "SprintShootout": (r"Sprint.?(kwalificatie|shootout)", None)}
+
+
+def f1_place_tokens(race: dict) -> set[str]:
+    loc = (race.get("Circuit") or {}).get("Location") or {}
+    words = {_fold(loc.get("country", "")), _fold(loc.get("locality", ""))}
+    words |= {F1_COUNTRY_NL.get(w, "") for w in list(words)}
+    words.add(_fold(re.sub(r"\s*Grand Prix\s*$", "", race.get("raceName", ""))))  # "las vegas", "abu dhabi"
+    return {re.sub(r"[^a-z0-9 ]+", " ", w).strip() for w in words if w and len(w) >= 3}
+
+
+def f1_rerun(session: dict, programs: list, channel_re: str) -> "Program | None":
+    """First full rerun of this session in the guide, after the live broadcast."""
+    want, avoid = F1_SESSION_RE.get(session["session"], (None, None))
+    if not want:
+        return None
+    live_end = session["start"] + session["minutes"] * 60
+    cands = []
+    for p in programs:
+        t = p.title
+        title_words = " " + re.sub(r"[^a-z0-9 ]+", " ", _fold(t)) + " "
+        if (p.start_at >= live_end - 15 * 60 and p.start_at - live_end < RERUN_WINDOW
+                and re.search(r"Formule 1", t, re.I) and re.search(want, t, re.I)
+                and not (avoid and re.search(avoid, t, re.I))
+                and not re.search(NOT_LIVE, t, re.I)
+                and re.search(channel_re, p.channel_name, re.I)
+                and any(f" {w} " in title_words for w in session["place"])):
+            cands.append(p)
+    return min(cands, key=lambda p: (p.start_at, channel_rank(p.channel_name))) if cands else None
 
 
 ESPN_SCHEDULE = "https://site.api.espn.com/apis/site/v2/sports/soccer/all/teams/{team}/schedule?fixture=true"
@@ -297,7 +344,9 @@ def plan_epg(db, rule, programs, now, notes, params=None) -> list[Plan]:
                  clean_title(p.title)) for (k, _), p in best.items()]
 
 
-def plan_f1(db, rule, params, now, notes, fetch) -> list[Plan]:
+def plan_f1(db, rule, params, now, notes, fetch, programs=()) -> list[Plan]:
+    """params: channel_id, rerun_if_cut (also record the guide's rerun when the
+    live session is cut by a higher-priority recording), rerun_channel_re."""
     channel_id = int(params["channel_id"])
     row = db.execute("SELECT display_name FROM channels WHERE id=?", (channel_id,)).fetchone()
     name = row[0] if row else str(channel_id)
@@ -308,8 +357,15 @@ def plan_f1(db, rule, params, now, notes, fetch) -> list[Plan]:
         if end <= now or s["start"] > now + horizon:
             continue
         prog = Program(None, channel_id, name, s["start"], end, s["title"])
-        plans.append(Plan(rule, prog, s["key"], s["start"] - rule["before_min"] * 60,
-                          end + rule["after_min"] * 60, s["title"]))
+        pl = Plan(rule, prog, s["key"], s["start"] - rule["before_min"] * 60,
+                  end + rule["after_min"] * 60, s["title"])
+        if params.get("rerun_if_cut"):
+            rr = f1_rerun(s, programs, params.get("rerun_channel_re", "Viaplay"))
+            if rr is not None:
+                rprog = Program(rr.id, rr.channel_id, rr.channel_name, rr.start_at, rr.end_at, s["title"])
+                pl.fallback = Plan(rule, rprog, s["key"] + ":rerun", rr.start_at - 5 * 60,
+                                   rr.end_at + 10 * 60, f"{s['title']} [herhaling {_local(rr.start_at)}]")
+        plans.append(pl)
     return plans
 
 
@@ -356,7 +412,7 @@ def plan(db: sqlite3.Connection, now: float | None = None,
         params = json.loads(rule.get("params") or "{}")
         try:
             if kind == "f1":
-                plans += plan_f1(db, rule, params, now, notes, fetch)
+                plans += plan_f1(db, rule, params, now, notes, fetch, programs)
             elif kind == "team":
                 plans += plan_team(db, rule, params, programs, now, notes, fetch)
             else:
@@ -418,7 +474,8 @@ def apply(db: sqlite3.Connection, plans: list[Plan], now: float | None = None,
     slots already taken (it can become two parts), or cancelled if nothing is
     left. This is recomputed every run, so a higher-priority programme that
     appears later in the guide still pushes an already scheduled one aside.
-    Recordings that are already running are never touched.
+    Recordings that are already running are never touched. A plan with a
+    fallback (e.g. the F1 rerun) also records that when it gets cut.
     """
     now = time.time() if now is None else now
     report: list[str] = []
@@ -441,14 +498,15 @@ def apply(db: sqlite3.Connection, plans: list[Plan], now: float | None = None,
             return db.execute("SELECT * FROM recordings WHERE id=?", (log["recording_id"],)).fetchone()
         return None
 
-    for pl in sorted(plans, key=lambda x: (x.rule["priority"], x.start_at)):
+    def process(pl) -> str:
+        """Schedule one plan; returns full | trimmed | cancelled | skipped | running."""
         fmt = time.strftime("%a %d-%m %H:%M", time.localtime(pl.start_at))
         log = find_log(pl.rule["id"], pl.key, pl.program.start_at)
         if log and log["state"] == "skipped":      # user said: not this one
-            continue
+            return "skipped"
         rec = recording(log)
         if rec is not None and rec["status"] == "recording":
-            continue                                # running: leave it alone (already busy)
+            return "running"                        # running: leave it alone (already busy)
 
         parts = free_parts(pl.start_at, pl.end_at, busy)
         if not parts:
@@ -472,12 +530,14 @@ def apply(db: sqlite3.Connection, plans: list[Plan], now: float | None = None,
             parts = []
 
         n = len(parts)
+        any_trim = n > 1
         cover = [b for b in busy if _overlaps(pl.start_at, pl.end_at, b["start_at"], b["end_at"])]
         blocker = _short(max(cover, key=lambda b: min(b["end_at"], pl.end_at) - max(b["start_at"], pl.start_at))
                          ["title"]) if cover else ""
         for i, (p0, p1) in enumerate(parts, 1):
             key = pl.key if i == 1 else f"{pl.key}#{i}"
             trimmed = p0 > pl.start_at + 1 or p1 < pl.end_at - 1
+            any_trim = any_trim or trimmed
             title = part_title(pl.title, i, n, p0, p1, trimmed, blocker)
             when = (time.strftime("%a %d-%m %H:%M", time.localtime(p0)) + "-"
                     + time.strftime("%H:%M", time.localtime(p1)))
@@ -498,11 +558,13 @@ def apply(db: sqlite3.Connection, plans: list[Plan], now: float | None = None,
                                    "state='scheduled', note=? WHERE id=?",
                                    (pl.program.start_at, pl.program.id, pl.program.channel_id,
                                     "trimmed" if trimmed else "", plog["id"]))
+                any_trim = any_trim or trimmed
                 continue
             report.append(f"scheduled {title} {when} on {pl.program.channel_name} ({pl.rule['name']})"
                           + (" (trimmed around a higher-priority recording)" if trimmed else "")
                           + (f"  [key {pl.key}]" if dry_run else ""))
             if dry_run:
+                busy[-1]["id"] = -1
                 continue
             rid = db.execute(
                 """INSERT INTO recordings (viewer_id, channel_id, title, start_at, end_at, timezone,
@@ -532,6 +594,29 @@ def apply(db: sqlite3.Connection, plans: list[Plan], now: float | None = None,
                         db.execute("DELETE FROM recordings WHERE id=?", (xrec["id"],))
                         db.execute("UPDATE autorecord_log SET recording_id=NULL, state='conflict', "
                                    "note='merged' WHERE id=?", (extra["id"],))
+        if n == 0:
+            return "cancelled"
+        return "trimmed" if any_trim else "full"
+
+    def drop(pl) -> None:
+        """Cancel the scheduled recording(s) of a plan that is no longer needed."""
+        for lg in db.execute("SELECT * FROM autorecord_log WHERE rule_id=? AND match_key=? "
+                             "AND recording_id IS NOT NULL", (pl.rule["id"], pl.key)).fetchall():
+            r = recording(lg)
+            if r is not None and r["status"] == "scheduled":
+                report.append(f"cancelled {r['title']}: the live broadcast is recorded in full")
+                if not dry_run:
+                    db.execute("DELETE FROM recordings WHERE id=?", (r["id"],))
+                    db.execute("UPDATE autorecord_log SET recording_id=NULL, state='conflict', "
+                               "note='not needed' WHERE id=?", (lg["id"],))
+
+    for pl in sorted(plans, key=lambda x: (x.rule["priority"], x.start_at)):
+        status = process(pl)
+        if pl.fallback is not None:
+            if status in ("trimmed", "cancelled"):
+                process(pl.fallback)               # live got cut: record the full rerun as well
+            elif status == "full":
+                drop(pl.fallback)
     if not dry_run:
         db.commit()
     return report

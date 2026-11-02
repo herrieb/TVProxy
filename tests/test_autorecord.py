@@ -463,3 +463,74 @@ def test_daily_show_records_every_new_episode_not_reruns(db):
     again = ar.run(db_path=path, now=NOW + 60)                    # idempotent
     assert not [line for line in again if line.startswith(("scheduled", "moved", "cancelled"))]
     assert len(recordings(db)) == 4
+
+
+# ---- F1 rerun when the live session is cut -----------------------------------
+
+def brazil(race_ts, quali_ts):
+    r = f1_race(21, "Brazilian Grand Prix", race_ts, quali_ts)
+    r["Circuit"] = {"Location": {"country": "Brazil", "locality": "São Paulo"}}
+    return r
+
+
+def _f1_psv_setup(db, psv_overlaps=True):
+    db.execute("INSERT INTO channels (id, display_name) VALUES (3546, 'NL: Viaplay F1 FHD ( Ziggo )')")
+    add_kind_rule(db, "PSV live", "team", {"espn_team_id": "148", "guide_word": "PSV"}, 10, 20, 10)
+    add_kind_rule(db, "Formule 1 live", "f1", {"channel_id": 3548, "rerun_if_cut": True}, 10, 30, 20)
+    race = NOW + 30 * H                                   # Sun 18:00
+    ko = race - 1.25 * H if psv_overlaps else race - 6 * H
+    doc_f1 = jolpica([brazil(race, race - 23 * H)])
+    doc_psv = espn([fixture("402", ko, "SC Cambuur", home=False, competition="Eredivisie")])
+    prog(db, 3578, ko - 15 * 60, ko + 1.9 * H, "Eredivisie: SC Cambuur - PSV")
+    prog(db, 3548, race - 3 * 24 * H, race - 3 * 24 * H + 2 * H, "Formule 1: GP van Brazilië Race")  # last year's
+    prog(db, 3548, race - 1 * H, race + 2.5 * H, "Formule 1: GP van Brazilië Race")                 # live
+    prog(db, 3547, race + 3 * H, race + 3.5 * H, "Formule 1 - Faster food Grand Prix van Brazilië")  # magazine
+    prog(db, 3548, race + 24 * H, race + 26 * H, "Formule 1: GP van Brazilië Race")                 # Mon rerun
+    prog(db, 3547, race + 26 * H, race + 28 * H, "Formule 1: GP van Brazilië Race")                 # later rerun
+    fetch = lambda url: doc_f1 if "jolpi" in url else doc_psv
+    return race, fetch
+
+
+def test_f1_rerun_recorded_when_live_race_is_cut(db):
+    race, fetch = _f1_psv_setup(db)
+    path = db.execute("PRAGMA database_list").fetchone()[2]
+    ar.run(db_path=path, now=NOW, fetch=fetch)
+    titles = {r["title"]: r for r in recordings(db)}
+    rerun = next(r for t, r in titles.items() if "[herhaling" in t)
+    assert rerun["channel_id"] == 3548
+    assert rerun["start_at"] == race + 24 * H - 300          # first rerun after the live race, Monday
+    assert rerun["end_at"] == race + 26 * H + 600
+    live = next(r for t, r in titles.items() if t.startswith("Formule 1") and "[gedeeltelijk" in t)
+    assert live["start_at"] > race                           # trimmed live part is kept
+    assert any("PSV" in t for t in titles)
+    assert len(titles) == 4                                   # PSV, F1 quali, F1 race (part), rerun
+
+
+def test_no_rerun_when_live_race_is_complete(db):
+    race, fetch = _f1_psv_setup(db, psv_overlaps=False)
+    path = db.execute("PRAGMA database_list").fetchone()[2]
+    ar.run(db_path=path, now=NOW, fetch=fetch)
+    assert not [r for r in recordings(db) if "[herhaling" in r["title"]]
+    assert any(r["title"] == "Formule 1: Brazilian Grand Prix – Race" for r in recordings(db))
+
+
+def test_rerun_cancelled_when_the_clash_goes_away(db):
+    race, fetch = _f1_psv_setup(db)
+    path = db.execute("PRAGMA database_list").fetchone()[2]
+    ar.run(db_path=path, now=NOW, fetch=fetch)
+    assert [r for r in recordings(db) if "[herhaling" in r["title"]]
+    db.execute("DELETE FROM epg_programs WHERE title LIKE '%Cambuur%'")   # match moved off the guide
+    db.commit()
+    fetch2 = lambda url: (jolpica([brazil(race, race - 23 * H)]) if "jolpi" in url else espn([]))
+    report = ar.run(db_path=path, now=NOW + 60, fetch=fetch2)
+    assert not [r for r in recordings(db) if "[herhaling" in r["title"]]
+    assert any(r["title"] == "Formule 1: Brazilian Grand Prix – Race" for r in recordings(db))
+    assert any("recorded in full" in line for line in report)
+
+
+def test_f1_place_tokens_match_dutch_titles():
+    toks = ar.f1_place_tokens(brazil(NOW, NOW))
+    assert "brazilie" in toks and "sao paulo" in toks
+    vegas = f1_race(22, "Las Vegas Grand Prix", NOW, NOW)
+    vegas["Circuit"] = {"Location": {"country": "USA", "locality": "Las Vegas"}}
+    assert "las vegas" in ar.f1_place_tokens(vegas)
