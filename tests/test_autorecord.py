@@ -534,3 +534,61 @@ def test_f1_place_tokens_match_dutch_titles():
     vegas = f1_race(22, "Las Vegas Grand Prix", NOW, NOW)
     vegas["Circuit"] = {"Location": {"country": "USA", "locality": "Las Vegas"}}
     assert "las vegas" in ar.f1_place_tokens(vegas)
+
+
+
+# ---- management -----------------------------------------------------------------
+
+def test_switching_a_rule_off_and_on(db):
+    add_rule(db, PSV_LEAD)
+    path = db.execute("PRAGMA database_list").fetchone()[2]
+    t = NOW + 5 * H
+    prog(db, 3578, t, t + 2 * H, "Eredivisie: PSV - Ajax")
+    prog(db, 3578, t + 48 * H, t + 50 * H, "Eredivisie: PSV - AZ")
+    ar.run(db_path=path, now=NOW)
+    assert len(recordings(db)) == 2
+    db.execute("UPDATE recordings SET status='recording' WHERE title LIKE '%Ajax%'")   # one is running
+    db.commit()
+    report = ar.set_rule_enabled(db, 1, False, now=NOW)
+    assert report == ["cancelled Eredivisie: PSV - AZ: rule switched off"]
+    assert [r["title"] for r in recordings(db)] == ["Eredivisie: PSV - Ajax"]          # running one stays
+    ar.run(db_path=path, now=NOW + 60)
+    assert len(recordings(db)) == 1                                                     # off: not re-planned
+    ar.set_rule_enabled(db, 1, True, now=NOW)
+    ar.run(db_path=path, now=NOW + 120)
+    assert sorted(r["title"] for r in recordings(db)) == ["Eredivisie: PSV - AZ", "Eredivisie: PSV - Ajax"]
+
+
+def test_upcoming_and_describe(db):
+    db.execute("INSERT INTO channels (id, display_name) VALUES (3546, 'NL: Viaplay F1 FHD ( Ziggo )')")
+    add_kind_rule(db, "Formule 1 live", "f1", {"channel_id": 3548, "rerun_if_cut": True}, 10, 30, 20)
+    add_kind_rule(db, "PSV live", "team", {"espn_team_id": "148", "guide_word": "PSV"}, 10, 20, 10)
+    rules = [dict(r) for r in db.execute("SELECT * FROM autorecord_rules ORDER BY id")]
+    assert ar.describe_rule(db, rules[0]).startswith("F1 calendar: qualifying, sprint and race on NL: Viaplay +TV")
+    assert "rerun" in ar.describe_rule(db, rules[0])
+    assert ar.describe_rule(db, rules[1]).startswith("All PSV matches")
+    path = db.execute("PRAGMA database_list").fetchone()[2]
+    race = NOW + 30 * H
+    ar.run(db_path=path, now=NOW, fetch=lambda url: jolpica([brazil(race, race - 23 * H)]) if "jolpi" in url else espn([]))
+    items = ar.upcoming(db, now=NOW)
+    assert [i["display_status"] for i in items] == ["scheduled", "scheduled"]
+    assert items[1]["title"] == "Formule 1: Brazilian Grand Prix – Race"
+    assert items[1]["channel"] == "NL: Viaplay +TV"
+
+
+def test_admin_page_renders_rules_switches_and_upcoming(db):
+    from app.admin_autorecord import render_body
+    add_rule(db, PSV_LEAD); add_rule(db, F1_SECOND)
+    db.execute("UPDATE autorecord_rules SET enabled=0 WHERE id=2")
+    db.commit()
+    path = db.execute("PRAGMA database_list").fetchone()[2]
+    t = NOW + 5 * H
+    prog(db, 3578, t, t + 2 * H, "Eredivisie: PSV - Ajax")
+    ar.run(db_path=path, now=NOW)
+    page = render_body(db, '<input type="hidden" name="_csrf" value="x">', now=NOW)
+    assert "PSV live" in page and "Formule 1 live" in page
+    assert page.count('action="/admin/autorecord/1/toggle"') == 1 and "Turn off" in page   # rule 1 on
+    assert 'action="/admin/autorecord/2/toggle"' in page and "Turn on" in page             # rule 2 off
+    assert "Eredivisie: PSV - Ajax" in page and ">Scheduled<" in page
+    assert page.count('name="_csrf"') == 3                                                  # every form
+    assert "<script" not in page

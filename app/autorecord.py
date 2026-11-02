@@ -632,6 +632,82 @@ def run(db_path: str = DB_PATH, dry_run: bool = False, now: float | None = None,
         db.close()
 
 
+# ---- management (admin page, CLI) -----------------------------------------
+
+def set_rule_enabled(db: sqlite3.Connection, rule_id: int, enabled: bool,
+                     now: float | None = None) -> list[str]:
+    """Switch a rule on/off. Off also removes its scheduled (not running)
+    recordings, so off really means off; on lets the next run re-plan them."""
+    now = time.time() if now is None else now
+    row = db.execute("SELECT name FROM autorecord_rules WHERE id=?", (rule_id,)).fetchone()
+    if not row:
+        raise KeyError(rule_id)
+    db.execute("UPDATE autorecord_rules SET enabled=? WHERE id=?", (1 if enabled else 0, rule_id))
+    report = []
+    if not enabled:
+        for lg in db.execute("SELECT l.id, l.recording_id, r.title FROM autorecord_log l "
+                             "JOIN recordings r ON r.id = l.recording_id "
+                             "WHERE l.rule_id=? AND r.status='scheduled'", (rule_id,)).fetchall():
+            db.execute("DELETE FROM recordings WHERE id=?", (lg["recording_id"],))
+            db.execute("UPDATE autorecord_log SET recording_id=NULL, state='conflict', "
+                       "note='rule switched off' WHERE id=?", (lg["id"],))
+            report.append(f"cancelled {lg['title']}: rule switched off")
+    db.commit()
+    return report
+
+
+def describe_rule(db: sqlite3.Connection, rule: dict) -> str:
+    """One line in plain English about what a rule records."""
+    params = json.loads(rule.get("params") or "{}")
+    kind = rule.get("kind") or "epg"
+    if kind == "f1":
+        ch = db.execute("SELECT display_name FROM channels WHERE id=?", (params.get("channel_id"),)).fetchone()
+        text = f"F1 calendar: qualifying, sprint and race on {ch[0] if ch else params.get('channel_id')}"
+        if params.get("rerun_if_cut"):
+            text += "; records the rerun if the live broadcast gets cut"
+        return text
+    if kind == "team":
+        return (f"All {params.get('guide_word', 'team')} matches (ESPN fixtures, every competition), "
+                f"channel taken from the TV guide")
+    text = f"TV guide: titles matching \u201c{rule.get('include_re', '')}\u201d"
+    if params.get("channel_re"):
+        text += f" on {params['channel_re'].replace(chr(92) + 'b', '')}"
+    if params.get("rerun_window_hours"):
+        text += ", every new episode (repeats skipped)"
+    return text
+
+
+def upcoming(db: sqlite3.Connection, now: float | None = None, days: int = 30) -> list[dict]:
+    """Planned / conflicting / skipped items of all rules in the coming days."""
+    now = time.time() if now is None else now
+    out = []
+    for row in db.execute(
+            """SELECT l.state, l.note, l.match_key, l.rule_id, r.name AS rule, r.enabled,
+                      rec.id AS rec_id, rec.title, rec.start_at, rec.end_at, rec.status,
+                      c.display_name AS channel, l.first_air_at
+                 FROM autorecord_log l JOIN autorecord_rules r ON r.id = l.rule_id
+                 LEFT JOIN recordings rec ON rec.id = l.recording_id
+                 LEFT JOIN channels c ON c.id = COALESCE(rec.channel_id, l.channel_id)
+                WHERE COALESCE(rec.end_at, l.first_air_at + 4*3600) > ?
+                  AND COALESCE(rec.start_at, l.first_air_at) < ?
+                ORDER BY COALESCE(rec.start_at, l.first_air_at)""", (now, now + days * 86400)):
+        d = dict(row)
+        title = d["title"] or d["match_key"]
+        if d["status"] == "recording":
+            status = "recording now"
+        elif d["rec_id"] and "[herhaling" in title:
+            status = "rerun"
+        elif d["rec_id"] and ("[gedeeltelijk" in title or "[deel " in title):
+            status = "partial"
+        elif d["rec_id"]:
+            status = "scheduled"
+        else:
+            status = d["state"]                       # conflict | skipped
+        d.update(title=title, display_status=status, when=d["start_at"] or d["first_air_at"])
+        out.append(d)
+    return out
+
+
 # ---- CLI -------------------------------------------------------------------
 
 def _viewer_id(db: sqlite3.Connection, name: str) -> int:
@@ -735,10 +811,11 @@ def main(argv=None) -> int:
         else:
             if args.cmd == "delete":
                 db.execute("DELETE FROM autorecord_rules WHERE id=?", (args.id,))
+                db.commit(); print("ok")
             else:
-                db.execute("UPDATE autorecord_rules SET enabled=? WHERE id=?",
-                           (1 if args.cmd == "enable" else 0, args.id))
-            db.commit(); print("ok")
+                for line in set_rule_enabled(db, args.id, args.cmd == "enable"):
+                    print(line)
+                print("ok")
     finally:
         db.close()
     return 0

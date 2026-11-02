@@ -145,6 +145,7 @@ NAV_ITEMS = [
     ("Channels",    "/admin/channels"),
     ("Connections", "/admin/connections"),
     ("Recordings",  "/admin/recordings"),
+    ("Auto-record", "/admin/autorecord"),
     ("Sessions",    "/admin/sessions"),
     ("Logs",        "/admin/logs"),
     ("System",      "/admin/system"),
@@ -158,9 +159,9 @@ def _nav(request: web.Request, current: str) -> str:
     if not user:
         return ""
     groups = {
-        "Operate": NAV_ITEMS[:5],
-        "Monitor": NAV_ITEMS[5:8],
-        "Configure": NAV_ITEMS[8:],
+        "Operate": NAV_ITEMS[:6],
+        "Monitor": NAV_ITEMS[6:9],
+        "Configure": NAV_ITEMS[9:],
     }
     links = []
     for group, items in groups.items():
@@ -479,6 +480,9 @@ def make_admin_subapp(stores: dict) -> web.Application:
 
     sub.router.add_get("/system", admin_system_get)
     sub.router.add_post("/system/restart", admin_system_restart)
+
+    from .admin_autorecord import add_routes as _autorecord_routes
+    _autorecord_routes(sub)
 
     return sub
 
