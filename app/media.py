@@ -68,6 +68,10 @@ Configuration (environment, normally /etc/tv-proxy-media.env):
                            a "Test .ts" group, served as /tv/<code>/<slug>.ts
                            (same stream, .ts URL for players that pick the
                            decoder from the extension); default none
+    MEDIA_REMOTE_PLAYLISTS comma-separated playlist URLs whose entries are appended to
+                           the merged playlist (e.g. the home server's recordings
+                           over Tailscale); skipped quietly when unreachable
+    MEDIA_PUBLIC_URL=lan   build links with this machine's current LAN address
     MEDIA_MERGE_VIEWERS    comma-separated viewer names or ids whose /tv/<code>
                            playlist gets the media entries; default none
     MEDIA_UPSTREAM         tv-proxy base URL, default http://127.0.0.1:8081
@@ -85,9 +89,12 @@ import logging
 import os
 import re
 import json
+import socket
 import sqlite3
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from pathlib import Path
 from urllib.parse import quote, urlsplit
 
@@ -122,6 +129,8 @@ NO_CACHE_HEADERS = {
     "Expires": "0",
 }
 
+LOCAL_ZONE = ZoneInfo(os.environ.get("MEDIA_TIMEZONE", "Europe/Amsterdam"))
+
 _KEY_RE = re.compile(r"^[a-z0-9_-]{1,32}$")
 # 20260910-164000-Title-With-Dashes-68.part3.ts  /  ...-Title-65-part02.ts
 _REC_RE = re.compile(
@@ -154,6 +163,7 @@ class Config:
     host: str = "0.0.0.0"
     port: int = 8090
     merge_viewers: frozenset = frozenset()
+    remote_playlists: tuple = ()
     ts_test: tuple = ()
     ts_urls: bool = False
     recording_lead: int = 60
@@ -177,6 +187,7 @@ class Config:
             host=env.get("MEDIA_HOST", "0.0.0.0"),
             port=int(env.get("MEDIA_PORT", "8090")),
             merge_viewers=frozenset(v.strip() for v in env.get("MEDIA_MERGE_VIEWERS", "").split(",") if v.strip()),
+            remote_playlists=tuple(u.strip() for u in env.get("MEDIA_REMOTE_PLAYLISTS", "").split(",") if u.strip()),
             recording_lead=int(env.get("MEDIA_RECORDING_LEAD", "60")),
             force_busy=env.get("MEDIA_FORCE_BUSY", "/var/lib/tv-proxy/force-busy"),
             inuse_clip=env.get("MEDIA_INUSE_CLIP", "/var/lib/tv-proxy/stream-in-use.ts"),
@@ -225,7 +236,10 @@ def recording_title(stem: str) -> tuple[str, int | None]:
     if not m:
         return _pretty(stem), None
     d, t = m["date"], m["time"]
-    title = f"{d[0:4]}-{d[4:6]}-{d[6:8]} {t[0:2]}:{t[2:4]} {_pretty(m['title'])}"
+    # the recorder stamps file names in UTC; show Dutch local time
+    stamp = datetime(int(d[0:4]), int(d[4:6]), int(d[6:8]), int(t[0:2]), int(t[2:4]),
+                     tzinfo=timezone.utc).astimezone(LOCAL_ZONE)
+    title = f"{stamp:%Y-%m-%d %H:%M} {_pretty(m['title'])}"
     return title, int(m["part"]) if m["part"] is not None else None
 
 
@@ -260,7 +274,12 @@ def scan(config: Config, viewer_id: int | None = None) -> list[Entry]:
             entries.extend(_recording_entries(source, config, viewer_id))
             continue
         files = list(_video_files(source.root, config.min_bytes))
-        for rel, _st in sorted(files, key=lambda f: _natural_key(f[0])):
+        rec_style = [f for f in files if _REC_RE.match(Path(f[0]).stem) and Path(f[0]).stem[:8].isdigit()]
+        others = [f for f in files if f not in rec_style]
+        # copies of recordings (e.g. on the home server): dated title, newest first
+        for rel, _st in sorted(rec_style, key=lambda f: Path(f[0]).name, reverse=True):
+            entries.append(Entry(source, rel, recording_title(Path(rel).stem)[0], source.label))
+        for rel, _st in sorted(others, key=lambda f: _natural_key(f[0])):
             folder = str(Path(rel).parent)
             group = source.label if folder == "." else f"{source.label} / {folder}"
             entries.append(Entry(source, rel, _pretty(Path(rel).stem), group))
@@ -518,6 +537,14 @@ class _NoMedia(Exception):
     """Viewer gets the live playlist only."""
 
 
+def lan_ip() -> str:
+    """This machine's address on the local network (the interface that routes to the
+    internet). Asked fresh every time, so a new DHCP address is picked up."""
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        s.connect(("1.1.1.1", 53))           # no packet is sent for UDP connect
+        return s.getsockname()[0]
+
+
 def create_app(config: Config) -> web.Application:
     if not config.token:
         raise RuntimeError("MEDIA_TOKEN is not set")
@@ -539,11 +566,16 @@ def create_app(config: Config) -> web.Application:
                 raise web.HTTPForbidden()
         return await handler(request)
 
+    def base_url(request) -> str:
+        if config.public_url == "lan":
+            return f"http://{lan_ip()}:{config.port}"
+        return config.public_url or f"{request.scheme}://{request.host}"
+
     async def health(_request):
         return web.Response(text="OK")
 
     async def playlist(request: web.Request):
-        base = config.public_url or f"{request.scheme}://{request.host}"
+        base = base_url(request)
         entries = await asyncio.to_thread(scan, config)
         logger.info("playlist for %s: %d items", request.remote, len(entries))
         return web.Response(
@@ -569,9 +601,11 @@ def create_app(config: Config) -> web.Application:
         try:  # never break live TV because of the media part
             if viewer_id is None:
                 raise _NoMedia()
-            base = config.public_url or f"{request.scheme}://{request.host}"
+            base = base_url(request)
             entries = await asyncio.to_thread(scan, config, viewer_id)
             body = merge_playlists(live, build_playlist(entries, base, config.token))
+            for url in config.remote_playlists:
+                body = merge_playlists(body, await remote_playlist(url))
             logger.info("merged playlist: %d live lines + %d media items",
                         live.count("#EXTINF"), len(entries))
         except _NoMedia:
@@ -580,6 +614,17 @@ def create_app(config: Config) -> web.Application:
             logger.exception("media scan failed; serving live playlist only")
         return web.Response(text=body, charset="utf-8", content_type="audio/x-mpegurl",
                             headers=NO_CACHE_HEADERS)
+
+    async def remote_playlist(url: str) -> str:
+        try:
+            timeout = aiohttp.ClientTimeout(total=4, connect=3)
+            async with app[HTTP_KEY].get(url, timeout=timeout) as resp:
+                if resp.status == 200:
+                    return await resp.text()
+                logger.warning("remote playlist: HTTP %s", resp.status)
+        except (aiohttp.ClientError, TimeoutError) as exc:
+            logger.warning("remote playlist unreachable: %s", type(exc).__name__)
+        return ""
 
     async def ts_stream(request: web.Request):
         """Same live stream as tv-proxy's /tv/<code>/<slug>.m3u8, under a .ts URL.

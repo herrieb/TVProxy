@@ -78,13 +78,13 @@ class TestRecordingTitle:
     def test_dot_part(self):
         title, part = recording_title(
             "20260910-164000-UEFA-Champions-League-PSV-Eindhoven---Sjachtar-Donetsk-68.part3")
-        assert title == "2026-09-10 16:40 UEFA Champions League PSV Eindhoven - Sjachtar Donetsk"
+        assert title == "2026-09-10 18:40 UEFA Champions League PSV Eindhoven - Sjachtar Donetsk"   # UTC -> CEST
         assert part == 3
 
     def test_dash_part(self):
         title, part = recording_title(
             "20260906-071737-F1-race---two-hour-diagnostic-recording-65-part02")
-        assert title == "2026-09-06 07:17 F1 race - two hour diagnostic recording"
+        assert title == "2026-09-06 09:17 F1 race - two hour diagnostic recording"
         assert part == 2
 
     def test_unknown_format(self):
@@ -132,10 +132,10 @@ class TestScan:
             _write(rec / f"20260910-182500-Formule-1-GP-Race-67.part{n}.ts")
 
         assert [e.title for e in scan(cfg, viewer_id=3)] == [
-            "2026-10-31 18:36 PSV - Willem II", "2026-10-01 20:00 Older"]
+            "2026-10-31 19:36 PSV - Willem II", "2026-10-01 22:00 Older"]
         assert [e.rel for e in scan(cfg, viewer_id=3)][0] == psv.name
         assert len(scan(cfg)) == 3                          # all viewers: + Herrie's
-        assert scan(cfg, viewer_id=2)[0].title == "2026-10-04 20:00 Herrie's"
+        assert scan(cfg, viewer_id=2)[0].title == "2026-10-04 22:00 Herrie's"
 
     def test_recording_deleted_disappears(self, tmp_path):
         psv = tmp_path / "rec" / "20261031-183600-PSV---Willem-II-97.ts"
@@ -417,7 +417,7 @@ class TestMerged:
         assert resp.status == 200
         assert text.startswith("#EXTM3U\n#EXTINF:-1 tvg-logo=")
         assert "https://tv.example/tv/ab12/espn.m3u8" in text
-        assert "2026-10-31 18:36 PSV - Willem II" in text
+        assert "2026-10-31 19:36 PSV - Willem II" in text
         assert f"https://tv.example/media/{TOKEN}/files/recordings/" in text
         assert "Herrie only" not in text and "Deleted" not in text
         assert text.count('group-title="Opnames"') == 1
@@ -816,3 +816,55 @@ async def test_clip_ends_promptly_for_a_tv_reading_at_playback_speed(tmp_path):
     assert first_at is not None and first_at < 1.0, "clip did not start streaming right away"
     assert ended_at is not None, "clip kept streaming after the recording ended"
     assert ended_at - finished < 2.0
+
+
+
+# ---- home server copies ("Opnames (thuis)") ---------------------------------
+
+def test_recording_copies_in_a_folder_get_dated_titles_newest_first(tmp_path):
+    cfg = _config(tmp_path)
+    home = Source("thuis", "Opnames (thuis)", tmp_path / "vid")
+    cfg = Config(**{**cfg.__dict__, "sources": (home,)})
+    _write(home.root / "20261101-180000-Old-1.ts")
+    _write(home.root / "20261104-200000-UEFA-Champions-League-PSV---Club-Brugge-101.ts")
+    _write(home.root / "holiday.mp4")
+    entries = scan(cfg)
+    assert [e.title for e in entries] == ["2026-11-04 21:00 UEFA Champions League PSV - Club Brugge",
+                                          "2026-11-01 19:00 Old", "holiday"]
+    assert {e.group for e in entries} == {"Opnames (thuis)"}
+
+
+def test_lan_ip_is_an_ipv4_address():
+    import app.media as m
+    ip = m.lan_ip()
+    assert ipaddress.ip_address(ip).version == 4
+
+
+async def test_public_url_lan_uses_local_address(tmp_path, client_factory, monkeypatch):
+    import app.media as m
+    monkeypatch.setattr(m, "lan_ip", lambda: "192.168.1.35")
+    cfg = Config(**{**_config(tmp_path).__dict__, "public_url": "lan", "port": 8090})
+    _write(cfg.sources[1].root / "clip.mp4")
+    client = await client_factory(cfg)
+    text = await (await client.get(f"/{TOKEN}/playlist.m3u")).text()
+    assert f"http://192.168.1.35:8090/{TOKEN}/files/videos/clip.mp4" in text
+
+
+async def test_remote_playlist_appended_and_unreachable_skipped(tmp_path, upstream, client_factory):
+    async def home(request):
+        return _web.Response(text='#EXTM3U\n#EXTINF:-1 group-title="Opnames (thuis)",Home rec\n'
+                                  'http://192.168.1.35:8090/t/files/thuis/x.ts\n',
+                             content_type="audio/x-mpegurl")
+    app = _web.Application(); app.router.add_get("/pl.m3u", home)
+    srv = TestServer(app); await srv.start_server()
+    try:
+        cfg = _merge_config(tmp_path, upstream, remote_playlists=(
+            str(srv.make_url("/pl.m3u")), "http://127.0.0.1:1/unreachable.m3u"))
+        client = await client_factory(cfg)
+        text = await (await client.get("/tv/ab12")).text()
+        assert 'group-title="Opnames (thuis)",Home rec\nhttp://192.168.1.35:8090/t/files/thuis/x.ts' in text
+        assert 'group-title="Opnames"' in text                     # the Pi's own group stays
+        assert text.count("#EXTM3U") == 1
+        assert "https://tv.example/tv/ab12/npo-1.m3u8" in text     # live channels untouched
+    finally:
+        await srv.close()

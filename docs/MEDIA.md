@@ -56,3 +56,15 @@ sudo bash deploy/publish-media.sh     # code update + nginx + merge settings (id
 
 Rotate the token: edit `MEDIA_TOKEN` in `/etc/tv-proxy-media.env`, `sudo systemctl restart tv-proxy-media`,
 and update the playlist URL on the TV.
+
+## Home server copies ("Opnames (thuis)")
+
+srv01 (at home, Tailscale 100.92.103.112) gets a nightly copy of finished recordings
+(`/usr/local/bin/tv-recordings-sync`, timer 04:00-08:00 Europe/Istanbul, read-only rsync
+key restricted with `rrsync -ro`) in `/mnt/data/tv/rec/`. The same `app/media.py` runs there
+as `tv-media.service` (`deploy/tv-media.service`, `/etc/tv-media.env` with its own token,
+`MEDIA_SOURCES=thuis:Opnames (thuis):/mnt/data/tv/rec`, `MEDIA_PUBLIC_URL=lan` so links use
+srv01's current LAN address). The Pi appends that playlist to the merged playlist via
+`MEDIA_REMOTE_PLAYLISTS` (over Tailscale; skipped when srv01 is unreachable), so the TV plays
+those copies over the home network. `MEDIA_TIMEZONE=Europe/Istanbul` on both: recorder file
+names are UTC, titles are shown in Turkish time.
