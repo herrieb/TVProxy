@@ -68,6 +68,8 @@ Configuration (environment, normally /etc/tv-proxy-media.env):
                            a "Test .ts" group, served as /tv/<code>/<slug>.ts
                            (same stream, .ts URL for players that pick the
                            decoder from the extension); default none
+    MEDIA_ICON_DIR         channel/category icons served without a token at
+                           /icons/<name>.png, default /var/lib/tv-proxy/icons
     MEDIA_REMOTE_PLAYLISTS comma-separated playlist URLs whose entries are appended to
                            the merged playlist (e.g. the home server's recordings
                            over Tailscale); skipped quietly when unreachable
@@ -164,6 +166,7 @@ class Config:
     port: int = 8090
     merge_viewers: frozenset = frozenset()
     remote_playlists: tuple = ()
+    icon_dir: str = "/var/lib/tv-proxy/icons"
     ts_test: tuple = ()
     ts_urls: bool = False
     recording_lead: int = 60
@@ -187,6 +190,7 @@ class Config:
             host=env.get("MEDIA_HOST", "0.0.0.0"),
             port=int(env.get("MEDIA_PORT", "8090")),
             merge_viewers=frozenset(v.strip() for v in env.get("MEDIA_MERGE_VIEWERS", "").split(",") if v.strip()),
+            icon_dir=env.get("MEDIA_ICON_DIR", "/var/lib/tv-proxy/icons"),
             remote_playlists=tuple(u.strip() for u in env.get("MEDIA_REMOTE_PLAYLISTS", "").split(",") if u.strip()),
             recording_lead=int(env.get("MEDIA_RECORDING_LEAD", "60")),
             force_busy=env.get("MEDIA_FORCE_BUSY", "/var/lib/tv-proxy/force-busy"),
@@ -559,7 +563,7 @@ def create_app(config: Config) -> web.Application:
             raise web.HTTPForbidden()
         if not any(ip in net for net in config.networks):
             raise web.HTTPForbidden()
-        if request.path != "/health" and request.match_info.route.name not in ("merged", "ts"):
+        if request.path != "/health" and request.match_info.route.name not in ("merged", "ts", "icons"):
             if not constant_time_eq(request.match_info.get("token", ""), config.token):
                 logger.warning("bad token from %s for %s", ip,
                                redact_token(request.match_info.get("token", "")))
@@ -570,6 +574,16 @@ def create_app(config: Config) -> web.Application:
         if config.public_url == "lan":
             return f"http://{lan_ip()}:{config.port}"
         return config.public_url or f"{request.scheme}://{request.host}"
+
+    async def icon(request: web.Request):
+        name = request.match_info["name"]
+        if not re.fullmatch(r"[a-z0-9-]{1,40}", name):
+            raise web.HTTPNotFound()
+        path = Path(config.icon_dir) / f"{name}.png"
+        if not path.is_file():
+            raise web.HTTPNotFound()
+        return web.FileResponse(path, headers={"Content-Type": "image/png",
+                                               "Cache-Control": "public, max-age=86400"})
 
     async def health(_request):
         return web.Response(text="OK")
@@ -804,6 +818,7 @@ def create_app(config: Config) -> web.Application:
     app = web.Application(middlewares=[guard])
     app.cleanup_ctx.append(http_client)
     app.router.add_get("/health", health)
+    app.router.add_get("/icons/{name}.png", icon, name="icons")
     # Registered before /{token}/playlist.m3u so /tv/<code> always lands here.
     app.router.add_get("/tv/{code}", merged, name="merged")
     app.router.add_get("/tv/{code}/{slug}.ts", ts_stream, name="ts")

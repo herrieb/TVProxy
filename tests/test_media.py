@@ -868,3 +868,17 @@ async def test_remote_playlist_appended_and_unreachable_skipped(tmp_path, upstre
         assert "https://tv.example/tv/ab12/npo-1.m3u8" in text     # live channels untouched
     finally:
         await srv.close()
+
+
+
+async def test_icons_are_public_and_safe(tmp_path, client_factory):
+    icons = tmp_path / "icons"; icons.mkdir()
+    (icons / "sport.png").write_bytes(b"\x89PNG fake")
+    cfg = Config(**{**_config(tmp_path).__dict__, "icon_dir": str(icons)})
+    client = await client_factory(cfg)
+    resp = await client.get("/icons/sport.png")                    # no token needed
+    assert resp.status == 200 and resp.headers["Content-Type"] == "image/png"
+    assert await resp.read() == b"\x89PNG fake"
+    assert (await client.get("/icons/missing.png")).status == 404
+    assert (await client.get("/icons/..%2F..%2Fetc%2Fpasswd.png")).status in (403, 404)
+    assert (await client.get("/icons/Sport.png")).status == 404       # strict names only

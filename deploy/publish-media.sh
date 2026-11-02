@@ -32,6 +32,15 @@ for img in recording-in-progress stream-in-use; do
   install -o tvproxy -g tvproxy -m 0644 "$HERE/deploy/$img.png" "$APP/deploy/$img.png"
 done
 install -o tvproxy -g tvproxy -m 0644 "$HERE/deploy/make_cards.py" "$APP/deploy/make_cards.py"
+# channel/category icons (made on a PC by deploy/make_icons.py)
+install -d -o tvproxy -g tvproxy -m 0755 /var/lib/tv-proxy/icons "$APP/deploy/icons"
+for f in "$HERE"/deploy/icons/*.png; do
+  install -o tvproxy -g tvproxy -m 0644 "$f" /var/lib/tv-proxy/icons/
+  install -o tvproxy -g tvproxy -m 0644 "$f" "$APP/deploy/icons/"
+done
+for f in deploy/make_icons.py app/logos.py; do
+  install -o tvproxy -g tvproxy -m 0644 "$HERE/$f" "$APP/$f"
+done
 [ "$REBUILD" = 0 ] || bash "$APP/deploy/make-busy-clip.sh"
 
 echo "== tests"
