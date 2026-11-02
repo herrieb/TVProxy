@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# Copy finished TV recordings from the Pi (tv-proxy) to the external HDD.
+# COPY ONLY: nothing is ever deleted or moved, on either side.
+#
+# Runs daily 04:00 Turkish time (tv-recordings-sync.timer) and stops at 08:00;
+# an interrupted file resumes the next night.
+#   --dry-run   show what would be copied (any time, copies nothing)
+#   --now       copy right away, for at most 1 hour (outside the night window)
+# Key ~/.ssh/tv_recordings_pull may only do read-only rsync of the Pi's
+# /var/lib/tv-proxy/recordings (rrsync -ro, from srv01's Tailscale IP).
+set -uo pipefail
+PI=100.92.27.95                          # raspberrypi over Tailscale
+KEY=/home/twan/.ssh/tv_recordings_pull
+MOUNT=/mnt/data                          # WD 2 TB external HDD
+DEST=/mnt/data/tv/rec
+ZONE=Europe/Istanbul
+STOP_AT=08:00
+BWLIMIT=${BWLIMIT:-3m}                   # 3 MiB/s ~ 25 Mbit/s: leaves room on the home line
+DRY=""; NOW=""
+case "${1:-}" in --dry-run) DRY="--dry-run" ;; --now) NOW=1 ;; "") ;; *) echo "usage: $0 [--dry-run|--now]"; exit 2 ;; esac
+
+if ! mountpoint -q "$MOUNT"; then
+    echo "ABORT: $MOUNT (external HDD) is not mounted - not copying to the system disk"; exit 1
+fi
+mkdir -p "$DEST"
+now=$(date +%s); stop=$(TZ=$ZONE date -d "today $STOP_AT" +%s)
+if [ -n "$DRY" ]; then left=600
+elif [ -n "$NOW" ]; then left=3600
+else
+    left=$(( stop - now ))
+    if [ "$left" -le 60 ]; then
+        echo "outside the 04:00-$STOP_AT window ($(TZ=$ZONE date +%H:%M) Turkish time): nothing done"; exit 0
+    fi
+fi
+SSH="ssh -i $KEY -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=20 -o ServerAliveInterval=30"
+# Finished recordings only: *.ts without "part" (part files are chunks of a
+# recording in progress, or leftovers of deleted recordings).
+LIST=$(mktemp); trap 'rm -f "$LIST"' EXIT
+if ! rsync --list-only -e "$SSH" "twan@$PI:./" > "$LIST.raw" 2>&1; then
+    echo "ABORT: cannot list recordings on the Pi:"; cat "$LIST.raw"; rm -f "$LIST.raw"; exit 2
+fi
+awk '$1 ~ /^-/ {print $5}' "$LIST.raw" | grep -E '\.ts$' | grep -vE '[.-]part[0-9]+\.ts$' > "$LIST" || true
+rm -f "$LIST.raw"
+echo "start $(TZ=$ZONE date '+%F %H:%M') Turkish time, may run $(( left / 60 )) min, $(wc -l < "$LIST") finished recordings on the Pi ${DRY:+(dry run)}"
+timeout --signal=TERM "$left" nice -n 10 ionice -c3 \
+  rsync -t --files-from="$LIST" --partial --partial-dir=.rsync-partial \
+        --bwlimit="$BWLIMIT" --timeout=300 --human-readable --out-format='  copied %n (%l bytes)' $DRY \
+        -e "$SSH" "twan@$PI:./" "$DEST/"
+rc=$?
+case $rc in
+  0)   echo "done: $(ls "$DEST" | grep -c '\.ts$') recordings in $DEST, $(du -sh "$DEST" | cut -f1) in total" ;;
+  124) echo "stopped at $STOP_AT Turkish time; the rest continues tomorrow (partial file kept)"; rc=0 ;;
+  *)   echo "rsync failed with code $rc" ;;
+esac
+exit $rc

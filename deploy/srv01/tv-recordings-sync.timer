@@ -1,0 +1,9 @@
+[Unit]
+Description=Copy TV recordings daily at 04:00 Turkish time (until 08:00)
+
+[Timer]
+OnCalendar=*-*-* 04:00:00 Europe/Istanbul
+Persistent=true
+
+[Install]
+WantedBy=timers.target

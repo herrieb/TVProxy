@@ -1,0 +1,12 @@
+[Unit]
+Description=Copy TV recordings from the Pi to /mnt/data/tv/rec (copy only)
+Wants=network-online.target
+After=network-online.target tailscaled.service
+RequiresMountsFor=/mnt/data
+
+[Service]
+Type=oneshot
+User=twan
+Group=twan
+ExecStart=/usr/local/bin/tv-recordings-sync
+Nice=10
